@@ -1,0 +1,47 @@
+spring:
+  application:
+    name: kirim
+  datasource:
+    url: jdbc:postgresql://localhost:5433/kirim
+    username: kirim
+    password: kirim
+  kafka:
+    bootstrap-servers: localhost:9092
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      acks: all
+      properties:
+        enable.idempotence: true
+        # Fail fast so the outbox relay can back off instead of blocking.
+        max.block.ms: 3000
+        request.timeout.ms: 2000
+        delivery.timeout.ms: 5000
+    consumer:
+      group-id: kirim-notifications
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+
+springdoc:
+  swagger-ui:
+    path: /swagger-ui.html
+
+kirim:
+  transfer:
+    max-amount: 50000000 # Rp 50.000.000 per transfer
+  outbox:
+    topic: transfer-events
+    scheduler-enabled: true
+    poll-interval-ms: 500
+    batch-size: 50
+    max-attempts: 8
+    initial-backoff: 1s
+    backoff-multiplier: 2.0
+    max-backoff: 5m

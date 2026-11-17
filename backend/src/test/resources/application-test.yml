@@ -1,0 +1,9 @@
+spring:
+  datasource:
+    hikari:
+      # The concurrency tests run 16 threads at once.
+      maximum-pool-size: 20
+
+kirim:
+  outbox:
+    scheduler-enabled: false

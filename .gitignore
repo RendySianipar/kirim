@@ -1,0 +1,13 @@
+# Gradle / Kotlin
+backend/.gradle/
+backend/build/
+backend/.kotlin/
+# IDE
+.idea/
+*.iml
+.vscode/
+# Node
+web/node_modules/
+web/dist/
+# OS
+.DS_Store
