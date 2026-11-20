@@ -103,6 +103,8 @@ Or run everything in Docker: `docker compose up --build`.
 - Metrics: http://localhost:8080/actuator/prometheus (`kirim_transfers_total`, `kirim_outbox_publish_total`, `kirim_ratelimit_total`, `kirim_cache_total`, …)
 - Risk service: http://localhost:8081/api/v1/alerts, `/api/v1/accounts/{id}/daily-activity`, Swagger at http://localhost:8081/swagger-ui.html
 
+Try every feature from PowerShell: see [scripts/demo](scripts/demo/README.md).
+
 ### Try the API
 
 ```bash
