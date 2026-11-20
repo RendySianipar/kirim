@@ -1,0 +1,19 @@
+# Used by the GitLab CI deploy job. The job appends an `images:` block that
+# points at this commit's images in the GitLab Container Registry, e.g.
+#   registry.gitlab.com/<group>/kirim/api:<short-sha>
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+
+# The registry is private: pods pull with a secret the deploy job creates.
+patches:
+  - target:
+      kind: Deployment
+      name: kirim-api|risk-service
+    patch: |-
+      - op: add
+        path: /spec/template/spec/imagePullSecrets
+        value:
+          - name: gitlab-registry

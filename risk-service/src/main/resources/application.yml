@@ -1,0 +1,46 @@
+server:
+  port: 8081
+
+spring:
+  application:
+    name: kirim-risk-service
+  datasource:
+    # Database per service: the risk service never reads the transfer service's
+    # tables. It only learns about transfers from Kafka events.
+    url: jdbc:postgresql://localhost:5433/kirim_risk
+    username: kirim
+    password: kirim
+  kafka:
+    bootstrap-servers: localhost:9092
+    consumer:
+      group-id: kirim-risk
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+    producer:
+      # Used only to publish failed messages to the dead-letter topic.
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      acks: all
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+
+springdoc:
+  swagger-ui:
+    path: /swagger-ui.html
+
+risk:
+  topic: transfer-events
+  # Transfers are bucketed into days in this zone (Indonesian business day).
+  zone: Asia/Jakarta
+  large-transfer-amount: 25000000  # Rp 25 juta in a single transfer
+  daily-total-amount: 100000000    # Rp 100 juta sent by one account in one day
+  daily-transfer-count: 20         # 20 transfers sent by one account in one day

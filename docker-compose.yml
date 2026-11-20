@@ -1,6 +1,8 @@
 # Local stack.
-#   docker compose up -d postgres kafka      -> infra only, run the API from your IDE
-#   docker compose up --build                -> everything, API on http://localhost:8080
+#   docker compose up -d postgres kafka redis   -> infra only, run the services from your IDE
+#   docker compose up --build                   -> everything: API on :8080, risk service on :8081
+# If you created the postgres volume before the risk service existed, run
+# `docker compose down -v` once so the kirim_risk database gets created.
 services:
   postgres:
     image: postgres:16-alpine
@@ -10,6 +12,8 @@ services:
       POSTGRES_PASSWORD: kirim
     ports:
       - "5433:5432"
+    volumes:
+      - ./deploy/postgres:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U kirim"]
       interval: 5s
@@ -37,12 +41,38 @@ services:
       interval: 5s
       retries: 20
 
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 10
+
   api:
     build: ./backend
     ports:
       - "8080:8080"
     environment:
       SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/kirim
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:19092
+      SPRING_DATA_REDIS_HOST: redis
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  risk-service:
+    build: ./risk-service
+    ports:
+      - "8081:8081"
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/kirim_risk
       SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:19092
     depends_on:
       postgres:

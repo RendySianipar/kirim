@@ -1,0 +1,5 @@
+# Small thresholds so tests can cross them with a few events.
+risk:
+  large-transfer-amount: 2000000
+  daily-total-amount: 3000000
+  daily-transfer-count: 5

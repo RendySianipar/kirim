@@ -1,0 +1,4089 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 624d05a..b0c0614 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -28,6 +28,36 @@ jobs:
+           name: backend-test-report
+           path: backend/build/reports/tests/test
+ 
++  risk-service:
++    name: Risk service (Java / Spring Boot)
++    runs-on: ubuntu-latest
++    defaults:
++      run:
++        working-directory: risk-service
++    steps:
++      - uses: actions/checkout@v4
++      - uses: actions/setup-java@v4
++        with:
++          distribution: temurin
++          java-version: "21"
++      - uses: gradle/actions/setup-gradle@v4
++      - run: chmod +x gradlew && ./gradlew build
++      - name: Upload test report
++        if: failure()
++        uses: actions/upload-artifact@v4
++        with:
++          name: risk-service-test-report
++          path: risk-service/build/reports/tests/test
++
++  manifests:
++    name: Kubernetes manifests
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      # kubectl is preinstalled on GitHub runners; render both overlays.
++      - run: kubectl kustomize deploy/k8s/overlays/local > /dev/null
++      - run: kubectl kustomize deploy/k8s/overlays/gitlab > /dev/null
++
+   web:
+     name: Web (React / TypeScript)
+     runs-on: ubuntu-latest
+@@ -49,7 +79,8 @@ jobs:
+   docker:
+     name: Docker image builds
+     runs-on: ubuntu-latest
+-    needs: backend
++    needs: [backend, risk-service]
+     steps:
+       - uses: actions/checkout@v4
+       - run: docker build -t kirim-api ./backend
++      - run: docker build -t kirim-risk-service ./risk-service
+diff --git a/.gitignore b/.gitignore
+index 953a4d3..69ec88a 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -2,6 +2,8 @@
+ backend/.gradle/
+ backend/build/
+ backend/.kotlin/
++risk-service/.gradle/
++risk-service/build/
+ # IDE
+ .idea/
+ *.iml
+diff --git a/.gitlab-ci.yml b/.gitlab-ci.yml
+new file mode 100644
+index 0000000..d433d41
+--- /dev/null
++++ b/.gitlab-ci.yml
+@@ -0,0 +1,164 @@
++# GitLab CI/CD for Kirim: test -> build images -> deploy to Kubernetes.
++#
++# Needs, in the GitLab project:
++#   - a GitLab agent for Kubernetes connected to the target cluster; put its
++#     context ("<project path>:<agent name>") in the KUBE_CONTEXT CI/CD variable
++#   - a deploy token named "gitlab-deploy-token" with read_registry, so GitLab
++#     provides CI_DEPLOY_USER / CI_DEPLOY_PASSWORD for the image pull secret
++# Merge requests run the tests; the default branch also builds and pushes the
++# images, and deploying is a manual button on the pipeline.
++
++stages:
++  - test
++  - build
++  - deploy
++
++variables:
++  # Testcontainers talks to the Docker-in-Docker service instead of a local socket.
++  DOCKER_HOST: tcp://docker:2375
++  DOCKER_TLS_CERTDIR: ""
++  TESTCONTAINERS_HOST_OVERRIDE: docker
++  TESTCONTAINERS_RYUK_DISABLED: "true"
++  GRADLE_OPTS: "-Dorg.gradle.daemon=false"
++  API_IMAGE: $CI_REGISTRY_IMAGE/api
++  RISK_IMAGE: $CI_REGISTRY_IMAGE/risk-service
++
++workflow:
++  rules:
++    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
++    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
++
++# ---------------------------------------------------------------- test
++
++.gradle-test:
++  stage: test
++  image: eclipse-temurin:21-jdk
++  services:
++    - name: docker:27-dind
++      alias: docker
++  variables:
++    GRADLE_USER_HOME: $CI_PROJECT_DIR/.gradle-home
++  cache:
++    key: gradle-$CI_JOB_NAME
++    paths:
++      - .gradle-home/caches/
++      - .gradle-home/wrapper/
++  script:
++    - cd "$SERVICE_DIR"
++    - chmod +x gradlew
++    # Unit tests + Testcontainers integration tests against real PostgreSQL, Kafka and Redis.
++    - ./gradlew build
++  artifacts:
++    when: always
++    reports:
++      junit: $SERVICE_DIR/build/test-results/test/TEST-*.xml
++    paths:
++      - $SERVICE_DIR/build/reports/tests/test/
++    expire_in: 1 week
++
++backend:test:
++  extends: .gradle-test
++  variables:
++    SERVICE_DIR: backend
++
++risk-service:test:
++  extends: .gradle-test
++  variables:
++    SERVICE_DIR: risk-service
++
++web:test:
++  stage: test
++  image: node:22
++  cache:
++    key:
++      files:
++        - web/package-lock.json
++    paths:
++      - web/.npm/
++  script:
++    - cd web
++    - npm ci --cache .npm --prefer-offline
++    - npm run lint
++    - npm test
++    - npm run build
++
++manifests:validate:
++  stage: test
++  image:
++    # The image used in GitLab's agent-for-Kubernetes docs; pin a digest for reproducible deploys.
++    name: bitnami/kubectl:latest
++    entrypoint: [""]
++  script:
++    # Renders both overlays; a typo in a manifest fails here, not during a deploy.
++    - kubectl kustomize deploy/k8s/overlays/local > /dev/null
++    - kubectl kustomize deploy/k8s/overlays/gitlab > /dev/null
++
++# ---------------------------------------------------------------- build
++
++.image-build:
++  stage: build
++  image: docker:27
++  services:
++    - name: docker:27-dind
++      alias: docker
++  rules:
++    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
++  before_script:
++    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
++  script:
++    # Tagged with the commit SHA, so every deploy is traceable and can be rolled back to an exact build.
++    - docker build -t "$IMAGE:$CI_COMMIT_SHORT_SHA" "$SERVICE_DIR"
++    - docker push "$IMAGE:$CI_COMMIT_SHORT_SHA"
++
++api:image:
++  extends: .image-build
++  needs: ["backend:test"]
++  variables:
++    IMAGE: $API_IMAGE
++    SERVICE_DIR: backend
++
++risk-service:image:
++  extends: .image-build
++  needs: ["risk-service:test"]
++  variables:
++    IMAGE: $RISK_IMAGE
++    SERVICE_DIR: risk-service
++
++# ---------------------------------------------------------------- deploy
++
++deploy:staging:
++  stage: deploy
++  image:
++    # The image used in GitLab's agent-for-Kubernetes docs; pin a digest for reproducible deploys.
++    name: bitnami/kubectl:latest
++    entrypoint: [""]
++  needs: ["api:image", "risk-service:image", "manifests:validate"]
++  rules:
++    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
++      when: manual
++  environment:
++    name: staging
++  resource_group: staging # one deploy at a time
++  script:
++    - kubectl config use-context "$KUBE_CONTEXT"
++    - kubectl apply -f deploy/k8s/base/namespace.yaml
++    # Pull secret for the private GitLab registry (idempotent: create or update).
++    - >
++      kubectl -n kirim create secret docker-registry gitlab-registry
++      --docker-server="$CI_REGISTRY" --docker-username="$CI_DEPLOY_USER" --docker-password="$CI_DEPLOY_PASSWORD"
++      --dry-run=client -o yaml | kubectl apply -f -
++    # Point the overlay at this commit's images.
++    - |
++      cat >> deploy/k8s/overlays/gitlab/kustomization.yaml <<EOF
++      images:
++        - name: kirim-api
++          newName: $API_IMAGE
++          newTag: "$CI_COMMIT_SHORT_SHA"
++        - name: kirim-risk-service
++          newName: $RISK_IMAGE
++          newTag: "$CI_COMMIT_SHORT_SHA"
++      EOF
++    - kubectl apply -k deploy/k8s/overlays/gitlab
++    # Fail the job if the new pods don't become ready (bad config, failing migration, crash loop).
++    - kubectl -n kirim rollout status deployment/kirim-api --timeout=300s
++    - kubectl -n kirim rollout status deployment/risk-service --timeout=300s
+diff --git a/README.md b/README.md
+index c9e68ee..e6a46f5 100644
+--- a/README.md
++++ b/README.md
+@@ -2,18 +2,20 @@
+ 
+ *Kirim* means "send" in Indonesian. This is a small digital-banking backend that moves money between accounts **safely under retries, concurrency and partial failure**, with a React client that shows those guarantees working.
+ 
+-It is built to show the building blocks of resilient back-end systems: **APIs, databases, messaging, idempotency and retries**.
++It is built to show the building blocks of resilient back-end systems: **APIs, databases, messaging, idempotency and retries**, split into two services (Kotlin and Java) and deployable to **Kubernetes** with **GitLab CI/CD**.
+ 
+ | Area | What's here |
+ |---|---|
+-| Back end | Kotlin 2.2, Spring Boot 3.5, Spring JDBC (`JdbcClient`), Flyway |
++| Back end | Transfer API: Kotlin 2.2, Spring Boot 3.5, Spring JDBC (`JdbcClient`), Flyway |
++| Risk service | **Java 21**, Spring Boot 3.5: AML-style alerts from transfer events, own database |
+ | Data | PostgreSQL 16: row locking, `ON CONFLICT`, `SKIP LOCKED`, `BIGINT` money |
+-| Messaging | Kafka: transactional outbox, retries with exponential backoff, dead-letter topic, idempotent consumer |
++| Messaging | Kafka: transactional outbox, retries with exponential backoff, dead-letter topics, idempotent consumers, two consumer groups |
++| Caching | Redis: per-account rate limiting (Lua, shared across replicas), cache-aside for immutable transfers, fails open |
+ | API | REST, `Idempotency-Key` header, RFC 9457 Problem Details, OpenAPI / Swagger UI |
+ | Front end | React 19 + TypeScript + Vite, retry-safe API client |
+ | Quality | Unit tests written first, Testcontainers integration tests, concurrency tests, Vitest |
+-| Delivery | Docker multi-stage build, docker-compose, GitHub Actions CI |
+-| Ops | Actuator health, Micrometer metrics, Prometheus endpoint |
++| Delivery | Docker multi-stage builds, docker-compose, **Kubernetes** (Kustomize), **GitLab CI/CD** (test, build, deploy), GitHub Actions |
++| Ops | Liveness/readiness/startup probes, Micrometer metrics, Prometheus endpoint, non-root read-only containers |
+ 
+ ---
+ 
+@@ -21,7 +23,8 @@ It is built to show the building blocks of resilient back-end systems: **APIs, d
+ 
+ ```mermaid
+ flowchart LR
+-    UI[React client] -- "POST /transfers<br/>Idempotency-Key" --> API[Transfer API]
++    UI[React client] -- "POST /transfers<br/>Idempotency-Key" --> API[Transfer API<br/>Kotlin]
++    API -- "rate limit, cache" --> R[(Redis)]
+     subgraph TX [One PostgreSQL transaction]
+         API --> IK[(idempotency_keys)]
+         API --> ACC[(accounts<br/>FOR UPDATE)]
+@@ -33,20 +36,27 @@ flowchart LR
+     K --> CONS[Notification consumer<br/>dedupe on eventId]
+     CONS -- after 4 retries --> DLT[[transfer-events-dlt]]
+     CONS --> NOTE[(notifications)]
++    K --> RISK[Risk service<br/>Java, group kirim-risk]
++    RISK --> RDB[(kirim_risk DB<br/>daily totals, alerts)]
++    RISK -- after 4 retries --> RDLT[[transfer-events-risk-dlt]]
+ ```
+ 
+ ### What happens on `POST /api/v1/transfers`
+ 
+ 1. **Reserve the idempotency key.** `INSERT ... ON CONFLICT DO NOTHING`. If the key exists, compare the request fingerprint (SHA-256 of the body): same body → **replay** the original transfer (`200`, `Idempotent-Replayed: true`); different body → `422`.
+-2. **Lock both accounts** with `SELECT ... FOR UPDATE ORDER BY id`. The fixed order means A→B and B→A running at the same time queue instead of deadlocking.
+-3. **Decide** with `TransferDecision`, a pure function covered by unit tests: approve, or reject with `INSUFFICIENT_FUNDS` / `LIMIT_EXCEEDED` / `CURRENCY_MISMATCH`.
+-4. **Write** the balances, two ledger entries (DEBIT + CREDIT) and an **outbox event**, all in the same transaction.
+-5. **Commit.** Either everything happened or nothing did.
++2. **Rate limit** the sending account in Redis (10 new transfers per minute by default). Over the limit → `429` with `Retry-After`, and the key reservation rolls back. Replays (step 1) never count.
++3. **Lock both accounts** with `SELECT ... FOR UPDATE ORDER BY id`. The fixed order means A→B and B→A running at the same time queue instead of deadlocking.
++4. **Decide** with `TransferDecision`, a pure function covered by unit tests: approve, or reject with `INSUFFICIENT_FUNDS` / `LIMIT_EXCEEDED` / `CURRENCY_MISMATCH`.
++5. **Write** the balances, two ledger entries (DEBIT + CREDIT) and an **outbox event**, all in the same transaction.
++6. **Commit.** Either everything happened or nothing did.
+ 
+ Then, asynchronously:
+ 
+-6. The **outbox relay** claims due events (`FOR UPDATE SKIP LOCKED`, so it's safe with many instances), publishes to Kafka with `acks=all` and an idempotent producer, and marks them `PUBLISHED`. On failure it retries with **exponential backoff** (1s, 2s, 4s, … capped at 5m) and parks the event as `FAILED` after `max-attempts`.
+-7. The **notification consumer** dedupes on `eventId` in the same transaction as its write, so **at-least-once delivery becomes effectively-once**. Failing messages are retried (0.5s → 4s) and then sent to the **dead-letter topic**. Malformed JSON skips the retries.
++7. The **outbox relay** claims due events (`FOR UPDATE SKIP LOCKED`, so it's safe with many instances), publishes to Kafka with `acks=all` and an idempotent producer, and marks them `PUBLISHED`. On failure it retries with **exponential backoff** (1s, 2s, 4s, … capped at 5m) and parks the event as `FAILED` after `max-attempts`.
++8. The **notification consumer** dedupes on `eventId` in the same transaction as its write, so **at-least-once delivery becomes effectively-once**. Failing messages are retried (0.5s → 4s) and then sent to the **dead-letter topic**. Malformed JSON skips the retries.
++9. The **risk service** reads the same topic in its own consumer group, adds the transfer to the sender's daily totals (Jakarta business day, one atomic upsert) and raises alerts: `LARGE_TRANSFER`, `DAILY_TOTAL_EXCEEDED`, `HIGH_DAILY_COUNT`.
++
++`GET /api/v1/transfers/{id}` reads Redis first, then PostgreSQL (cache-aside). Transfers never change after commit, so the cache never needs invalidating.
+ 
+ ### Why these choices
+ 
+@@ -57,6 +67,8 @@ Then, asynchronously:
+ | Rejections are stored, not thrown | A rejected transfer is a real event: it is audited, published, and replayed identically on retry | Return `4xx` and store nothing |
+ | Transactional outbox | Avoids the dual-write problem (DB commit OK but Kafka publish lost, or the reverse) | Publish inside the request; CDC with Debezium |
+ | Plain SQL via `JdbcClient` | Locking and `ON CONFLICT` semantics are explicit and reviewable | JPA/Hibernate |
++| Redis for rate limits and cache only | Shared across replicas; never the source of truth, so a Redis outage degrades instead of breaking transfers | Idempotency in Redis (`SETNX`): can't be atomic with the PostgreSQL write |
++| Separate risk service, Kafka-only input | Detection must not slow down or fail transfers; database per service | Checks inside the transfer transaction |
+ 
+ More detail in [`docs/adr`](docs/adr).
+ 
+@@ -68,7 +80,7 @@ More detail in [`docs/adr`](docs/adr).
+ 
+ ```bash
+ # 1. Infrastructure
+-docker compose up -d postgres kafka
++docker compose up -d postgres kafka redis
+ 
+ # 2. API on :8080 (Flyway creates the schema on startup)
+ cd backend
+@@ -78,13 +90,18 @@ cd backend
+ cd ../web
+ npm install
+ npm run dev
++
++# 4. (optional) Risk service on :8081
++cd ../risk-service
++./gradlew bootRun
+ ```
+ 
+-Or run the API in Docker too: `docker compose up --build`.
++Or run everything in Docker: `docker compose up --build`.
+ 
+ - Swagger UI: http://localhost:8080/swagger-ui.html
+ - Health: http://localhost:8080/actuator/health
+-- Metrics: http://localhost:8080/actuator/prometheus (`kirim_transfers_total`, `kirim_outbox_publish_total`, …)
++- Metrics: http://localhost:8080/actuator/prometheus (`kirim_transfers_total`, `kirim_outbox_publish_total`, `kirim_ratelimit_total`, `kirim_cache_total`, …)
++- Risk service: http://localhost:8081/api/v1/alerts, `/api/v1/accounts/{id}/daily-activity`, Swagger at http://localhost:8081/swagger-ui.html
+ 
+ ### Try the API
+ 
+@@ -113,10 +130,34 @@ In the web UI, **Double-tap** fires two requests with the same key at once. Both
+ 
+ ---
+ 
++---
++
++## Running on Kubernetes
++
++Manifests are in [`deploy/k8s`](deploy/k8s): a Kustomize base (API, risk service, PostgreSQL, Kafka, Redis) and two overlays.
++
++```bash
++kind create cluster --name kirim
++docker build -t kirim-api:dev ./backend
++docker build -t kirim-risk-service:dev ./risk-service
++kind load docker-image kirim-api:dev kirim-risk-service:dev --name kirim
++kubectl apply -k deploy/k8s/overlays/local
++kubectl -n kirim get pods -w
++kubectl -n kirim port-forward svc/kirim-api 8080:80
++```
++
++What the manifests show: 2 API replicas (safe thanks to `SKIP LOCKED` and Redis-shared rate limits), rolling updates with `maxUnavailable: 0`, a `PodDisruptionBudget`, startup/liveness/readiness probes (readiness = PostgreSQL only), non-root read-only containers, and config/secrets via Kustomize generators. PostgreSQL, Kafka and Redis are single-instance development setups; see [ADR 0006](docs/adr/0006-kubernetes-and-gitlab-ci.md).
++
++## CI/CD
++
++- **GitLab CI** ([`.gitlab-ci.yml`](.gitlab-ci.yml)): `test` (both Gradle builds with Testcontainers on Docker-in-Docker, web, manifest render) → `build` (images tagged with the commit SHA, pushed to the GitLab registry) → `deploy` (manual, via the GitLab agent for Kubernetes, waits for `rollout status`). Needs a `KUBE_CONTEXT` variable and a `gitlab-deploy-token` deploy token.
++- **GitHub Actions** ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)): the same builds and tests on every push.
++
+ ## Tests
+ 
+ ```bash
+-cd backend && ./gradlew test   # needs Docker running (Testcontainers)
++cd backend && ./gradlew test        # needs Docker running (Testcontainers)
++cd risk-service && ./gradlew test   # same
+ cd web && npm test
+ ```
+ 
+@@ -128,9 +169,14 @@ cd web && npm test
+ | `ConcurrentTransferIntegrationTest` | 200 random transfers on 16 threads: **no deadlocks, no money created or lost, no negative balances**; 10 concurrent calls with one key → **exactly one transfer** |
+ | `OutboxRelayIntegrationTest` | Retry timing with a controllable clock; `FAILED` after max attempts; transient failures recover |
+ | `TransferEventFlowIntegrationTest` | Real Kafka end to end; duplicate delivery does not duplicate notifications |
++| `TransferRateLimiterIntegrationTest` | Real Redis, controlled clock: limit per window, window rollover, per-account isolation, TTL always set, fail-open / fail-closed / disabled |
++| `RateLimitApiIntegrationTest` | `429` + `Retry-After` problem details; replays use no quota; a limited request doesn't burn its idempotency key |
++| `TransferCacheIntegrationTest` | Nothing cached inside the write transaction; miss then hit; cached copy equals the DB row; 404s not cached |
++| `RiskRulesTest` (Java) | Each AML rule at its threshold; daily alerts fire once at the crossing; Jakarta day boundary |
++| `RiskEventFlowIntegrationTest` (Java) | Real Kafka: alerts and daily totals, duplicate delivery counted once, rejected transfers ignored, poison message → risk DLT without blocking the partition |
+ | `retry.test.ts` | Client retries 5xx/409/429/network errors with backoff, never 4xx |
+ 
+-Integration tests run against **real PostgreSQL and Kafka** in Docker (Testcontainers), not H2 or mocks, because locking and `ON CONFLICT` behaviour is exactly what's being tested.
++Integration tests run against **real PostgreSQL, Kafka and Redis** in Docker (Testcontainers), not H2 or mocks, because locking and `ON CONFLICT` behaviour is exactly what's being tested.
+ 
+ ---
+ 
+@@ -142,9 +188,17 @@ backend/src/main/kotlin/dev/rendy/kirim/
+   transfer/      TransferDecision (pure rules), TransferService (the transaction), idempotency
+   outbox/        outbox table, relay + backoff, Kafka publisher
+   notification/  Kafka consumer (idempotent), notifications API
++  ratelimit/     Redis rate limiter (Lua fixed window)
+   common/        Problem Details error handling, JDBC helpers
+   config/        Kafka topics + error handler / DLT, OpenAPI, CORS, Clock
+ backend/src/main/resources/db/migration/   Flyway SQL
++risk-service/src/main/java/dev/rendy/kirim/risk/
++  rules/         RiskRules (pure, unit tested), thresholds
++  event/         TransferEvent contract, Kafka listener
++  store/         daily totals upsert, alerts (JdbcClient)
++  api/           alerts and daily-activity endpoints
++deploy/k8s/      Kustomize base + overlays (local kind, GitLab deploy)
++.gitlab-ci.yml   test → build → deploy pipeline
+ web/src/api/     typed client + retry helper (tested)
+ web/src/App.tsx  accounts, send / double-tap, statement, live notifications
+ docs/adr/        architecture decision records
+diff --git a/backend/build.gradle.kts b/backend/build.gradle.kts
+index 13dcea4..a4fd9b8 100644
+--- a/backend/build.gradle.kts
++++ b/backend/build.gradle.kts
+@@ -26,6 +26,7 @@ dependencies {
+     implementation("org.springframework.boot:spring-boot-starter-jdbc")
+     implementation("org.springframework.boot:spring-boot-starter-validation")
+     implementation("org.springframework.boot:spring-boot-starter-actuator")
++    implementation("org.springframework.boot:spring-boot-starter-data-redis")
+     implementation("org.springframework.kafka:spring-kafka")
+     implementation("org.flywaydb:flyway-core")
+     implementation("org.flywaydb:flyway-database-postgresql")
+diff --git a/backend/gradlew b/backend/gradlew
+old mode 100644
+new mode 100755
+diff --git a/backend/src/main/kotlin/dev/rendy/kirim/common/Errors.kt b/backend/src/main/kotlin/dev/rendy/kirim/common/Errors.kt
+index 896faee..774d1be 100644
+--- a/backend/src/main/kotlin/dev/rendy/kirim/common/Errors.kt
++++ b/backend/src/main/kotlin/dev/rendy/kirim/common/Errors.kt
+@@ -1,7 +1,10 @@
+ package dev.rendy.kirim.common
+ 
++import dev.rendy.kirim.ratelimit.RateLimitExceededException
++import org.springframework.http.HttpHeaders
+ import org.springframework.http.HttpStatus
+ import org.springframework.http.ProblemDetail
++import org.springframework.http.ResponseEntity
+ import org.springframework.web.bind.annotation.ExceptionHandler
+ import org.springframework.web.bind.annotation.RestControllerAdvice
+ import org.springframework.web.servlet.mvc.method.annotation.ResponseEntityExceptionHandler
+@@ -52,6 +55,13 @@ class GlobalExceptionHandler : ResponseEntityExceptionHandler() {
+             setProperty("code", ex.code)
+         }
+ 
++    /** 429 also tells the client when to come back (Retry-After, in seconds). */
++    @ExceptionHandler(RateLimitExceededException::class)
++    fun handleRateLimited(ex: RateLimitExceededException): ResponseEntity<ProblemDetail> =
++        ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
++            .header(HttpHeaders.RETRY_AFTER, ex.retryAfterSeconds.toString())
++            .body(handleApiException(ex))
++
+     @ExceptionHandler(IllegalArgumentException::class)
+     fun handleIllegalArgument(ex: IllegalArgumentException): ProblemDetail =
+         ProblemDetail.forStatusAndDetail(HttpStatus.BAD_REQUEST, ex.message ?: "Invalid request").apply {
+diff --git a/backend/src/main/kotlin/dev/rendy/kirim/ratelimit/TransferRateLimiter.kt b/backend/src/main/kotlin/dev/rendy/kirim/ratelimit/TransferRateLimiter.kt
+new file mode 100644
+index 0000000..d7e0d25
+--- /dev/null
++++ b/backend/src/main/kotlin/dev/rendy/kirim/ratelimit/TransferRateLimiter.kt
+@@ -0,0 +1,93 @@
++package dev.rendy.kirim.ratelimit
++
++import dev.rendy.kirim.common.ApiException
++import io.micrometer.core.instrument.MeterRegistry
++import org.slf4j.LoggerFactory
++import org.springframework.boot.context.properties.ConfigurationProperties
++import org.springframework.dao.DataAccessException
++import org.springframework.data.redis.core.StringRedisTemplate
++import org.springframework.data.redis.core.script.DefaultRedisScript
++import org.springframework.http.HttpStatus
++import org.springframework.stereotype.Component
++import java.time.Clock
++import java.time.Duration
++import java.util.UUID
++
++@ConfigurationProperties("kirim.rate-limit")
++data class RateLimitProperties(
++    val enabled: Boolean = true,
++    /** New transfers one source account may start per window. */
++    val transfersPerWindow: Long = 10,
++    val window: Duration = Duration.ofMinutes(1),
++    /**
++     * What to do when Redis is unreachable. true = allow the transfer (the rate
++     * limiter is a guard rail; balance and per-transfer limits are still enforced
++     * by PostgreSQL). false = reject with 503.
++     */
++    val failOpen: Boolean = true,
++)
++
++class RateLimitExceededException(val retryAfterSeconds: Long) :
++    ApiException(HttpStatus.TOO_MANY_REQUESTS, "RATE_LIMITED", "Too many transfers from this account; retry in $retryAfterSeconds s")
++
++class RateLimiterUnavailableException :
++    ApiException(HttpStatus.SERVICE_UNAVAILABLE, "RATE_LIMITER_UNAVAILABLE", "Transfers are temporarily unavailable; retry shortly")
++
++/**
++ * Fixed-window rate limit per source account, stored in Redis.
++ *
++ * Key: kirim:rl:transfers:{accountId}:{windowNumber}. INCR and EXPIRE run in one
++ * Lua script, so the counter can never be left without a TTL (which would block
++ * the account forever) and every app instance shares the same counter.
++ *
++ * Fixed windows allow a burst of up to 2x the limit across a window boundary.
++ * That is acceptable for a guard rail; a sliding window or token bucket would
++ * fix it at the cost of more Redis work per request.
++ */
++@Component
++class TransferRateLimiter(
++    private val redis: StringRedisTemplate,
++    private val props: RateLimitProperties,
++    private val clock: Clock,
++    private val meters: MeterRegistry,
++) {
++    private val log = LoggerFactory.getLogger(javaClass)
++
++    private val script = DefaultRedisScript(
++        """
++        local count = redis.call('INCR', KEYS[1])
++        if count == 1 then
++          redis.call('EXPIRE', KEYS[1], ARGV[1])
++        end
++        return count
++        """.trimIndent(),
++        Long::class.javaObjectType,
++    )
++
++    /** Throws [RateLimitExceededException] when [accountId] is over its limit for the current window. */
++    fun acquire(accountId: UUID) {
++        if (!props.enabled) return
++
++        val windowSeconds = props.window.seconds.coerceAtLeast(1)
++        val nowSeconds = clock.instant().epochSecond
++        val windowNumber = nowSeconds / windowSeconds
++        val key = "kirim:rl:transfers:$accountId:$windowNumber"
++
++        val count: Long? = try {
++            redis.execute(script, listOf(key), windowSeconds.toString())
++        } catch (ex: DataAccessException) {
++            meters.counter("kirim.ratelimit", "result", "error").increment()
++            if (props.failOpen) {
++                log.warn("Redis unavailable, allowing transfer from {} without rate limiting: {}", accountId, ex.message)
++                return
++            }
++            throw RateLimiterUnavailableException()
++        }
++
++        if (count != null && count > props.transfersPerWindow) {
++            meters.counter("kirim.ratelimit", "result", "rejected").increment()
++            throw RateLimitExceededException(retryAfterSeconds = windowSeconds - (nowSeconds % windowSeconds))
++        }
++        meters.counter("kirim.ratelimit", "result", "allowed").increment()
++    }
++}
+diff --git a/backend/src/main/kotlin/dev/rendy/kirim/transfer/TransferCache.kt b/backend/src/main/kotlin/dev/rendy/kirim/transfer/TransferCache.kt
+new file mode 100644
+index 0000000..616878a
+--- /dev/null
++++ b/backend/src/main/kotlin/dev/rendy/kirim/transfer/TransferCache.kt
+@@ -0,0 +1,68 @@
++package dev.rendy.kirim.transfer
++
++import com.fasterxml.jackson.databind.ObjectMapper
++import io.micrometer.core.instrument.MeterRegistry
++import org.slf4j.LoggerFactory
++import org.springframework.boot.context.properties.ConfigurationProperties
++import org.springframework.data.redis.core.StringRedisTemplate
++import org.springframework.stereotype.Component
++import java.time.Duration
++import java.util.UUID
++
++@ConfigurationProperties("kirim.cache.transfers")
++data class TransferCacheProperties(
++    val enabled: Boolean = true,
++    val ttl: Duration = Duration.ofMinutes(10),
++)
++
++/**
++ * Cache-aside for transfers in Redis.
++ *
++ * Transfers are immutable once committed (COMPLETED or REJECTED, never updated),
++ * so a cached copy can never go stale and there is nothing to invalidate. That is
++ * why transfers are cached and account balances are not.
++ *
++ * Only committed data is cached: entries are written on the read path, never
++ * inside the transaction that creates the transfer (which could still roll back).
++ *
++ * Redis errors are logged and treated as a miss: the cache makes reads cheaper,
++ * it is never the source of truth.
++ */
++@Component
++class TransferCache(
++    private val redis: StringRedisTemplate,
++    private val objectMapper: ObjectMapper,
++    private val props: TransferCacheProperties,
++    private val meters: MeterRegistry,
++) {
++    private val log = LoggerFactory.getLogger(javaClass)
++
++    fun get(id: UUID): Transfer? {
++        if (!props.enabled) return null
++        return try {
++            val json = redis.opsForValue().get(key(id))
++            if (json == null) {
++                meters.counter("kirim.cache", "cache", "transfers", "result", "miss").increment()
++                null
++            } else {
++                meters.counter("kirim.cache", "cache", "transfers", "result", "hit").increment()
++                objectMapper.readValue(json, Transfer::class.java)
++            }
++        } catch (ex: Exception) {
++            meters.counter("kirim.cache", "cache", "transfers", "result", "error").increment()
++            log.warn("Transfer cache read failed for {}, falling back to the database: {}", id, ex.message)
++            null
++        }
++    }
++
++    fun put(transfer: Transfer) {
++        if (!props.enabled) return
++        try {
++            redis.opsForValue().set(key(transfer.id), objectMapper.writeValueAsString(transfer), props.ttl)
++        } catch (ex: Exception) {
++            log.warn("Transfer cache write failed for {}: {}", transfer.id, ex.message)
++        }
++    }
++
++    private fun key(id: UUID) = "kirim:transfer:$id"
++}
+diff --git a/backend/src/main/kotlin/dev/rendy/kirim/transfer/TransferService.kt b/backend/src/main/kotlin/dev/rendy/kirim/transfer/TransferService.kt
+index 3354a47..b41ef35 100644
+--- a/backend/src/main/kotlin/dev/rendy/kirim/transfer/TransferService.kt
++++ b/backend/src/main/kotlin/dev/rendy/kirim/transfer/TransferService.kt
+@@ -14,6 +14,7 @@ import dev.rendy.kirim.outbox.OutboxEvent
+ import dev.rendy.kirim.outbox.OutboxRepository
+ import dev.rendy.kirim.outbox.TransferEvent
+ import dev.rendy.kirim.outbox.TransferEventType
++import dev.rendy.kirim.ratelimit.TransferRateLimiter
+ import io.micrometer.core.instrument.MeterRegistry
+ import org.springframework.boot.context.properties.ConfigurationProperties
+ import org.springframework.stereotype.Service
+@@ -36,6 +37,8 @@ class TransferService(
+     private val clock: Clock,
+     private val props: TransferProperties,
+     private val meters: MeterRegistry,
++    private val rateLimiter: TransferRateLimiter,
++    private val cache: TransferCache,
+ ) {
+ 
+     /**
+@@ -56,14 +59,23 @@ class TransferService(
+             return replay(idempotencyKey, fingerprint)
+         }
+ 
++        // Checked after the key is reserved, so replays of an earlier request never
++        // use up quota. If the limit is hit, the exception rolls back the key and the
++        // client can retry later with the same key.
++        rateLimiter.acquire(command.fromAccountId)
++
+         val transfer = execute(command, now)
+         idempotency.attachTransfer(idempotencyKey, transfer.id)
+         meters.counter("kirim.transfers", "status", transfer.status.name).increment()
+         return TransferResult(transfer, replayed = false)
+     }
+ 
++    /** Cache-aside: Redis first, then PostgreSQL (and fill the cache). Safe because transfers never change. */
+     @Transactional(readOnly = true)
+-    fun get(id: UUID): Transfer = transfers.findById(id) ?: throw TransferNotFoundException(id)
++    fun get(id: UUID): Transfer =
++        cache.get(id)
++            ?: transfers.findById(id)?.also { cache.put(it) }
++            ?: throw TransferNotFoundException(id)
+ 
+     private fun replay(key: String, fingerprint: String): TransferResult {
+         val record = idempotency.find(key) ?: throw IdempotentRequestInProgressException(key)
+diff --git a/backend/src/main/resources/application.yml b/backend/src/main/resources/application.yml
+index a78b6a7..b82a844 100644
+--- a/backend/src/main/resources/application.yml
++++ b/backend/src/main/resources/application.yml
+@@ -5,6 +5,14 @@ spring:
+     url: jdbc:postgresql://localhost:5433/kirim
+     username: kirim
+     password: kirim
++  data:
++    redis:
++      host: localhost
++      port: 6379
++      # Short timeouts: the rate limiter fails open, so a slow Redis must not
++      # hold the transfer transaction (and its row locks) for long.
++      timeout: 500ms
++      connect-timeout: 500ms
+   kafka:
+     bootstrap-servers: localhost:9092
+     producer:
+@@ -28,12 +36,32 @@ management:
+     web:
+       exposure:
+         include: health,info,metrics,prometheus
++  endpoint:
++    health:
++      probes:
++        enabled: true # /actuator/health/liveness and /readiness for Kubernetes
++      group:
++        readiness:
++          # Ready = can serve transfers = PostgreSQL is up. Redis is left out on
++          # purpose: the app keeps working without it (rate limiter fails open,
++          # cache misses go to the DB), so a Redis outage must not take pods out
++          # of the Service.
++          include: readinessState,db
+ 
+ springdoc:
+   swagger-ui:
+     path: /swagger-ui.html
+ 
+ kirim:
++  rate-limit:
++    enabled: true
++    transfers-per-window: 10 # new transfers per source account...
++    window: 1m               # ...per minute
++    fail-open: true
++  cache:
++    transfers:
++      enabled: true
++      ttl: 10m
+   transfer:
+     max-amount: 50000000 # Rp 50.000.000 per transfer
+   outbox:
+diff --git a/backend/src/test/kotlin/dev/rendy/kirim/ratelimit/RateLimitApiIntegrationTest.kt b/backend/src/test/kotlin/dev/rendy/kirim/ratelimit/RateLimitApiIntegrationTest.kt
+new file mode 100644
+index 0000000..e9d44ad
+--- /dev/null
++++ b/backend/src/test/kotlin/dev/rendy/kirim/ratelimit/RateLimitApiIntegrationTest.kt
+@@ -0,0 +1,59 @@
++package dev.rendy.kirim.ratelimit
++
++import com.fasterxml.jackson.databind.ObjectMapper
++import dev.rendy.kirim.account.AccountService
++import dev.rendy.kirim.support.IntegrationTest
++import org.junit.jupiter.api.Test
++import org.springframework.beans.factory.annotation.Autowired
++import org.springframework.http.MediaType
++import org.springframework.test.context.TestPropertySource
++import org.springframework.test.web.servlet.MockMvc
++import org.springframework.test.web.servlet.post
++import java.util.UUID
++import kotlin.test.assertEquals
++
++/**
++ * The HTTP side of rate limiting, with a limit of 2 per day so the window
++ * cannot roll over during the test. (This needs its own Spring context, and
++ * so its own containers, because the limit is a startup property.)
++ */
++@TestPropertySource(properties = ["kirim.rate-limit.transfers-per-window=2", "kirim.rate-limit.window=24h"])
++class RateLimitApiIntegrationTest : IntegrationTest() {
++
++    @Autowired lateinit var mockMvc: MockMvc
++    @Autowired lateinit var objectMapper: ObjectMapper
++    @Autowired lateinit var accounts: AccountService
++
++    private fun postTransfer(key: String, from: UUID, to: UUID, amount: Long) = mockMvc.post("/api/v1/transfers") {
++        contentType = MediaType.APPLICATION_JSON
++        header("Idempotency-Key", key)
++        content = objectMapper.writeValueAsString(mapOf("fromAccountId" to from, "toAccountId" to to, "amount" to amount))
++    }
++
++    @Test
++    fun `over the limit is a 429 with Retry-After, replays are free and the rejected key is not burned`() {
++        val alice = accounts.open("Alice", "IDR", 100_000)
++        val bob = accounts.open("Bob", "IDR", 0)
++
++        postTransfer("rl-1", alice.id, bob.id, 1_000).andExpect { status { isCreated() } }
++        postTransfer("rl-2", alice.id, bob.id, 1_000).andExpect { status { isCreated() } }
++
++        // A retry of an earlier request is answered from the idempotency record and uses no quota.
++        postTransfer("rl-1", alice.id, bob.id, 1_000).andExpect { status { isOk() } }
++
++        postTransfer("rl-3", alice.id, bob.id, 1_000).andExpect {
++            status { isTooManyRequests() }
++            header { exists("Retry-After") }
++            content { contentTypeCompatibleWith(MediaType.APPLICATION_PROBLEM_JSON) }
++            jsonPath("$.code") { value("RATE_LIMITED") }
++        }
++
++        assertEquals(98_000L, accounts.get(alice.id).balance, "the limited transfer moved no money")
++        val keyRows = jdbc.sql("SELECT COUNT(*) FROM idempotency_keys WHERE idempotency_key = 'rl-3'")
++            .query(Long::class.javaObjectType).single()
++        assertEquals(0L, keyRows, "the rejected request rolled back, so the client can retry with the same key later")
++
++        // Bob has his own quota.
++        postTransfer("rl-bob", bob.id, alice.id, 500).andExpect { status { isCreated() } }
++    }
++}
+diff --git a/backend/src/test/kotlin/dev/rendy/kirim/ratelimit/TransferRateLimiterIntegrationTest.kt b/backend/src/test/kotlin/dev/rendy/kirim/ratelimit/TransferRateLimiterIntegrationTest.kt
+new file mode 100644
+index 0000000..eff62c8
+--- /dev/null
++++ b/backend/src/test/kotlin/dev/rendy/kirim/ratelimit/TransferRateLimiterIntegrationTest.kt
+@@ -0,0 +1,113 @@
++package dev.rendy.kirim.ratelimit
++
++import dev.rendy.kirim.support.IntegrationTest
++import dev.rendy.kirim.support.MutableClock
++import io.micrometer.core.instrument.simple.SimpleMeterRegistry
++import org.junit.jupiter.api.Test
++import org.junit.jupiter.api.assertDoesNotThrow
++import org.junit.jupiter.api.assertThrows
++import org.springframework.data.redis.connection.RedisStandaloneConfiguration
++import org.springframework.data.redis.connection.lettuce.LettuceClientConfiguration
++import org.springframework.data.redis.connection.lettuce.LettuceConnectionFactory
++import org.springframework.data.redis.core.StringRedisTemplate
++import java.time.Duration
++import java.time.Instant
++import java.util.UUID
++import kotlin.test.assertEquals
++import kotlin.test.assertTrue
++
++/**
++ * The limiter against a real Redis, with a clock the test controls so window
++ * boundaries are exact instead of depending on when the test happens to run.
++ */
++class TransferRateLimiterIntegrationTest : IntegrationTest() {
++
++    /** 10 seconds into a minute, so the current window has 50 seconds left. */
++    private val clock = MutableClock(Instant.parse("2026-01-01T00:00:10Z"))
++
++    private fun limiter(props: RateLimitProperties, template: StringRedisTemplate = redis) =
++        TransferRateLimiter(template, props, clock, SimpleMeterRegistry())
++
++    private val threePerMinute = RateLimitProperties(transfersPerWindow = 3, window = Duration.ofMinutes(1))
++
++    @Test
++    fun `allows up to the limit, then rejects with the seconds left in the window`() {
++        val limiter = limiter(threePerMinute)
++        val account = UUID.randomUUID()
++
++        repeat(3) { limiter.acquire(account) }
++        val ex = assertThrows<RateLimitExceededException> { limiter.acquire(account) }
++
++        assertEquals(50L, ex.retryAfterSeconds)
++    }
++
++    @Test
++    fun `a new window starts a new count`() {
++        val limiter = limiter(threePerMinute)
++        val account = UUID.randomUUID()
++        repeat(3) { limiter.acquire(account) }
++        assertThrows<RateLimitExceededException> { limiter.acquire(account) }
++
++        clock.advance(Duration.ofSeconds(50)) // 00:01:00, next window
++
++        assertDoesNotThrow { limiter.acquire(account) }
++    }
++
++    @Test
++    fun `accounts are limited independently`() {
++        val limiter = limiter(threePerMinute)
++        val busy = UUID.randomUUID()
++        repeat(3) { limiter.acquire(busy) }
++
++        assertDoesNotThrow { limiter.acquire(UUID.randomUUID()) }
++    }
++
++    @Test
++    fun `every counter gets a TTL so Redis cleans up after itself`() {
++        val account = UUID.randomUUID()
++        limiter(threePerMinute).acquire(account)
++
++        val windowNumber = clock.instant().epochSecond / 60
++        val ttl = redis.getExpire("kirim:rl:transfers:$account:$windowNumber")
++
++        assertTrue(ttl in 1L..60L, "expected a TTL of at most one window, got $ttl")
++    }
++
++    @Test
++    fun `fails open when Redis is down, by default`() {
++        withUnreachableRedis { broken ->
++            assertDoesNotThrow { limiter(threePerMinute, broken).acquire(UUID.randomUUID()) }
++        }
++    }
++
++    @Test
++    fun `fails closed with 503 when configured to`() {
++        withUnreachableRedis { broken ->
++            assertThrows<RateLimiterUnavailableException> {
++                limiter(threePerMinute.copy(failOpen = false), broken).acquire(UUID.randomUUID())
++            }
++        }
++    }
++
++    @Test
++    fun `does not touch Redis when disabled`() {
++        withUnreachableRedis { broken ->
++            assertDoesNotThrow {
++                limiter(threePerMinute.copy(enabled = false, failOpen = false), broken).acquire(UUID.randomUUID())
++            }
++        }
++    }
++
++    /** A template pointing at a port nothing listens on. */
++    private fun withUnreachableRedis(block: (StringRedisTemplate) -> Unit) {
++        val clientConfig = LettuceClientConfiguration.builder().commandTimeout(Duration.ofMillis(500)).build()
++        val factory = LettuceConnectionFactory(RedisStandaloneConfiguration("localhost", 1), clientConfig)
++        factory.afterPropertiesSet()
++        factory.start()
++        try {
++            block(StringRedisTemplate(factory))
++        } finally {
++            factory.destroy()
++        }
++    }
++}
+diff --git a/backend/src/test/kotlin/dev/rendy/kirim/support/IntegrationTest.kt b/backend/src/test/kotlin/dev/rendy/kirim/support/IntegrationTest.kt
+index b8106b4..1fdd3cd 100644
+--- a/backend/src/test/kotlin/dev/rendy/kirim/support/IntegrationTest.kt
++++ b/backend/src/test/kotlin/dev/rendy/kirim/support/IntegrationTest.kt
+@@ -8,8 +8,11 @@ import org.springframework.boot.test.context.TestConfiguration
+ import org.springframework.boot.testcontainers.service.connection.ServiceConnection
+ import org.springframework.context.annotation.Bean
+ import org.springframework.context.annotation.Import
++import org.springframework.data.redis.core.RedisCallback
++import org.springframework.data.redis.core.StringRedisTemplate
+ import org.springframework.jdbc.core.simple.JdbcClient
+ import org.springframework.test.context.ActiveProfiles
++import org.testcontainers.containers.GenericContainer
+ import org.testcontainers.containers.PostgreSQLContainer
+ import org.testcontainers.kafka.ConfluentKafkaContainer
+ import org.testcontainers.utility.DockerImageName
+@@ -19,8 +22,11 @@ import java.time.Instant
+ import java.time.ZoneId
+ import java.time.ZoneOffset
+ 
++/** Typed subclass so withExposedPorts() returns a usable type in Kotlin (GenericContainer<SELF>). */
++class RedisContainer(image: DockerImageName) : GenericContainer<RedisContainer>(image)
++
+ /**
+- * Real PostgreSQL and Kafka in Docker via Testcontainers; @ServiceConnection
++ * Real PostgreSQL, Kafka and Redis in Docker via Testcontainers; @ServiceConnection
+  * wires their URLs into Spring automatically. Needs Docker running.
+  */
+ @TestConfiguration(proxyBeanMethods = false)
+@@ -33,6 +39,10 @@ class TestcontainersConfiguration {
+     @Bean
+     @ServiceConnection
+     fun kafka(): ConfluentKafkaContainer = ConfluentKafkaContainer(DockerImageName.parse("confluentinc/cp-kafka:7.8.0"))
++
++    @Bean
++    @ServiceConnection(name = "redis")
++    fun redis(): RedisContainer = RedisContainer(DockerImageName.parse("redis:7-alpine")).withExposedPorts(6379)
+ }
+ 
+ /**
+@@ -50,11 +60,19 @@ abstract class IntegrationTest {
+     @Autowired
+     lateinit var jdbc: JdbcClient
+ 
++    @Autowired
++    lateinit var redis: StringRedisTemplate
++
+     @BeforeEach
+     fun cleanDatabase() {
+         jdbc.sql(
+             "TRUNCATE notifications, processed_events, outbox_events, idempotency_keys, ledger_entries, transfers, accounts CASCADE",
+         ).update()
++        // Rate-limit counters and cached transfers must not leak between tests.
++        redis.execute(RedisCallback<Any?> { connection ->
++            connection.serverCommands().flushDb()
++            null
++        })
+     }
+ }
+ 
+diff --git a/backend/src/test/kotlin/dev/rendy/kirim/transfer/TransferCacheIntegrationTest.kt b/backend/src/test/kotlin/dev/rendy/kirim/transfer/TransferCacheIntegrationTest.kt
+new file mode 100644
+index 0000000..476b687
+--- /dev/null
++++ b/backend/src/test/kotlin/dev/rendy/kirim/transfer/TransferCacheIntegrationTest.kt
+@@ -0,0 +1,71 @@
++package dev.rendy.kirim.transfer
++
++import dev.rendy.kirim.account.AccountService
++import dev.rendy.kirim.common.TransferNotFoundException
++import dev.rendy.kirim.support.IntegrationTest
++import io.micrometer.core.instrument.MeterRegistry
++import org.junit.jupiter.api.Test
++import org.junit.jupiter.api.assertThrows
++import org.springframework.beans.factory.annotation.Autowired
++import org.springframework.test.web.servlet.MockMvc
++import org.springframework.test.web.servlet.get
++import java.util.UUID
++import kotlin.test.assertEquals
++import kotlin.test.assertFalse
++import kotlin.test.assertTrue
++
++class TransferCacheIntegrationTest : IntegrationTest() {
++
++    @Autowired lateinit var mockMvc: MockMvc
++    @Autowired lateinit var accounts: AccountService
++    @Autowired lateinit var service: TransferService
++    @Autowired lateinit var repository: TransferRepository
++    @Autowired lateinit var meters: MeterRegistry
++
++    private fun count(result: String) = meters.counter("kirim.cache", "cache", "transfers", "result", result).count()
++
++    private fun createTransfer(): Transfer {
++        val alice = accounts.open("Alice", "IDR", 50_000)
++        val bob = accounts.open("Bob", "IDR", 0)
++        return service.transfer(UUID.randomUUID().toString(), TransferCommand(alice.id, bob.id, 7_000, "IDR", "kopi")).transfer
++    }
++
++    @Test
++    fun `creating a transfer does not cache it, the first read fills the cache and the second is a hit`() {
++        val transfer = createTransfer()
++        assertFalse(redis.hasKey("kirim:transfer:${transfer.id}"), "nothing is cached inside the write transaction")
++
++        val misses = count("miss")
++        val hits = count("hit")
++
++        mockMvc.get("/api/v1/transfers/${transfer.id}").andExpect { status { isOk() } }
++        mockMvc.get("/api/v1/transfers/${transfer.id}").andExpect {
++            status { isOk() }
++            jsonPath("$.description") { value("kopi") }
++        }
++
++        assertEquals(misses + 1, count("miss"))
++        assertEquals(hits + 1, count("hit"))
++        val ttl = redis.getExpire("kirim:transfer:${transfer.id}")
++        assertTrue(ttl in 1L..600L, "cached entries expire, got TTL $ttl")
++    }
++
++    @Test
++    fun `the cached copy is identical to the database row`() {
++        val transfer = createTransfer()
++        service.get(transfer.id) // fills the cache
++
++        val cached = service.get(transfer.id)
++
++        assertEquals(repository.findById(transfer.id), cached)
++    }
++
++    @Test
++    fun `unknown transfers are a 404 and are not cached`() {
++        val ghost = UUID.randomUUID()
++
++        assertThrows<TransferNotFoundException> { service.get(ghost) }
++
++        assertFalse(redis.hasKey("kirim:transfer:$ghost"))
++    }
++}
+diff --git a/backend/src/test/resources/application-test.yml b/backend/src/test/resources/application-test.yml
+index 27019cf..30bdc3a 100644
+--- a/backend/src/test/resources/application-test.yml
++++ b/backend/src/test/resources/application-test.yml
+@@ -5,5 +5,8 @@ spring:
+       maximum-pool-size: 20
+ 
+ kirim:
++  rate-limit:
++    # High enough for the concurrency tests; RateLimitIntegrationTest lowers it.
++    transfers-per-window: 100000
+   outbox:
+     scheduler-enabled: false
+diff --git a/deploy/k8s/base/kafka.yaml b/deploy/k8s/base/kafka.yaml
+new file mode 100644
+index 0000000..5aa9018
+--- /dev/null
++++ b/deploy/k8s/base/kafka.yaml
+@@ -0,0 +1,100 @@
++# Single-node Kafka in KRaft mode (no ZooKeeper), enough for development.
++# Production: 3+ brokers with replication factor 3 and min.insync.replicas 2,
++# usually via the Strimzi operator or a managed service (Confluent Cloud, MSK).
++apiVersion: v1
++kind: Service
++metadata:
++  name: kafka
++  labels:
++    app.kubernetes.io/name: kafka
++spec:
++  selector:
++    app.kubernetes.io/name: kafka
++  ports:
++    - name: client
++      port: 9092
++      targetPort: client
++---
++apiVersion: apps/v1
++kind: StatefulSet
++metadata:
++  name: kafka
++  labels:
++    app.kubernetes.io/name: kafka
++spec:
++  serviceName: kafka
++  replicas: 1
++  selector:
++    matchLabels:
++      app.kubernetes.io/name: kafka
++  template:
++    metadata:
++      labels:
++        app.kubernetes.io/name: kafka
++    spec:
++      # Without this, Kubernetes injects KAFKA_PORT, KAFKA_SERVICE_HOST, ... for the
++      # "kafka" Service, and the image would read them as broker settings.
++      enableServiceLinks: false
++      securityContext:
++        fsGroup: 1000 # the image runs as uid 1000 and must own the data volume
++      containers:
++        - name: kafka
++          image: apache/kafka:3.9.0
++          ports:
++            - name: client
++              containerPort: 9092
++            - name: controller
++              containerPort: 9093
++          env:
++            - name: KAFKA_NODE_ID
++              value: "1"
++            - name: KAFKA_PROCESS_ROLES
++              value: broker,controller
++            - name: KAFKA_LISTENERS
++              value: PLAINTEXT://:9092,CONTROLLER://:9093
++            - name: KAFKA_ADVERTISED_LISTENERS
++              value: PLAINTEXT://kafka:9092
++            - name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP
++              value: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
++            - name: KAFKA_CONTROLLER_LISTENER_NAMES
++              value: CONTROLLER
++            - name: KAFKA_INTER_BROKER_LISTENER_NAME
++              value: PLAINTEXT
++            - name: KAFKA_CONTROLLER_QUORUM_VOTERS
++              value: 1@localhost:9093
++            - name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR
++              value: "1"
++            - name: KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR
++              value: "1"
++            - name: KAFKA_TRANSACTION_STATE_LOG_MIN_ISR
++              value: "1"
++            - name: KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS
++              value: "0"
++            - name: KAFKA_LOG_DIRS
++              value: /var/lib/kafka/data
++          readinessProbe:
++            tcpSocket:
++              port: client
++            periodSeconds: 5
++          livenessProbe:
++            tcpSocket:
++              port: client
++            initialDelaySeconds: 60
++            periodSeconds: 10
++          resources:
++            requests:
++              cpu: 250m
++              memory: 768Mi
++            limits:
++              memory: 1Gi
++          volumeMounts:
++            - name: data
++              mountPath: /var/lib/kafka/data
++  volumeClaimTemplates:
++    - metadata:
++        name: data
++      spec:
++        accessModes: ["ReadWriteOnce"]
++        resources:
++          requests:
++            storage: 2Gi
+diff --git a/deploy/k8s/base/kirim-api.yaml b/deploy/k8s/base/kirim-api.yaml
+new file mode 100644
+index 0000000..33801f4
+--- /dev/null
++++ b/deploy/k8s/base/kirim-api.yaml
+@@ -0,0 +1,129 @@
++# The transfer API. Two replicas is safe by design:
++#  - the outbox relay claims rows with FOR UPDATE SKIP LOCKED, so instances never send the same event twice at once
++#  - the rate-limit counters live in Redis, shared by every replica
++#  - the notification consumer is one Kafka consumer group, partitions are split between replicas
++apiVersion: v1
++kind: Service
++metadata:
++  name: kirim-api
++  labels:
++    app.kubernetes.io/name: kirim-api
++spec:
++  selector:
++    app.kubernetes.io/name: kirim-api
++  ports:
++    - name: http
++      port: 80
++      targetPort: http
++---
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: kirim-api
++  labels:
++    app.kubernetes.io/name: kirim-api
++spec:
++  replicas: 2
++  strategy:
++    type: RollingUpdate
++    rollingUpdate:
++      maxUnavailable: 0 # never drop below the desired count during a deploy
++      maxSurge: 1
++  selector:
++    matchLabels:
++      app.kubernetes.io/name: kirim-api
++  template:
++    metadata:
++      labels:
++        app.kubernetes.io/name: kirim-api
++      annotations:
++        prometheus.io/scrape: "true"
++        prometheus.io/path: /actuator/prometheus
++        prometheus.io/port: "8080"
++    spec:
++      terminationGracePeriodSeconds: 40
++      affinity:
++        podAntiAffinity:
++          preferredDuringSchedulingIgnoredDuringExecution:
++            - weight: 100
++              podAffinityTerm:
++                topologyKey: kubernetes.io/hostname
++                labelSelector:
++                  matchLabels:
++                    app.kubernetes.io/name: kirim-api
++      containers:
++        - name: api
++          image: kirim-api
++          imagePullPolicy: IfNotPresent
++          ports:
++            - name: http
++              containerPort: 8080
++          envFrom:
++            - configMapRef:
++                name: kirim-api-config
++          env:
++            - name: SPRING_DATASOURCE_USERNAME
++              valueFrom:
++                secretKeyRef:
++                  name: kirim-db
++                  key: username
++            - name: SPRING_DATASOURCE_PASSWORD
++              valueFrom:
++                secretKeyRef:
++                  name: kirim-db
++                  key: password
++          # Spring Boot exposes these groups when it detects Kubernetes (and via
++          # management.endpoint.health.probes.enabled). Readiness checks PostgreSQL
++          # only; see application.yml for why Redis is left out.
++          startupProbe:
++            httpGet:
++              path: /actuator/health/liveness
++              port: http
++            periodSeconds: 5
++            failureThreshold: 30 # up to 150s for JVM start + Flyway
++          livenessProbe:
++            httpGet:
++              path: /actuator/health/liveness
++              port: http
++            periodSeconds: 10
++            failureThreshold: 3
++          readinessProbe:
++            httpGet:
++              path: /actuator/health/readiness
++              port: http
++            periodSeconds: 5
++            failureThreshold: 3
++          lifecycle:
++            preStop:
++              # Give the Service time to stop routing here before Spring starts its graceful shutdown.
++              exec:
++                command: ["sleep", "10"]
++          resources:
++            requests:
++              cpu: 250m
++              memory: 512Mi
++            limits:
++              memory: 768Mi
++          securityContext:
++            runAsNonRoot: true
++            runAsUser: 1001
++            allowPrivilegeEscalation: false
++            readOnlyRootFilesystem: true
++            capabilities:
++              drop: ["ALL"]
++          volumeMounts:
++            - name: tmp
++              mountPath: /tmp # Tomcat's work directory; the rest of the filesystem is read-only
++      volumes:
++        - name: tmp
++          emptyDir: {}
++---
++apiVersion: policy/v1
++kind: PodDisruptionBudget
++metadata:
++  name: kirim-api
++spec:
++  minAvailable: 1 # node drains and cluster upgrades keep at least one API pod serving
++  selector:
++    matchLabels:
++      app.kubernetes.io/name: kirim-api
+diff --git a/deploy/k8s/base/kustomization.yaml b/deploy/k8s/base/kustomization.yaml
+new file mode 100644
+index 0000000..922d83a
+--- /dev/null
++++ b/deploy/k8s/base/kustomization.yaml
+@@ -0,0 +1,40 @@
++# Kirim on Kubernetes: transfer API (Kotlin), risk service (Java), PostgreSQL,
++# Kafka and Redis. Apply an overlay, not this base directly:
++#   kubectl apply -k deploy/k8s/overlays/local
++apiVersion: kustomize.config.k8s.io/v1beta1
++kind: Kustomization
++
++namespace: kirim
++
++labels:
++  - pairs:
++      app.kubernetes.io/part-of: kirim
++
++resources:
++  - namespace.yaml
++  - postgres.yaml
++  - kafka.yaml
++  - redis.yaml
++  - kirim-api.yaml
++  - risk-service.yaml
++
++# Development credentials only. In a real cluster these come from a secret
++# manager (External Secrets, Sealed Secrets, Vault), never from Git.
++secretGenerator:
++  - name: kirim-db
++    literals:
++      - username=kirim
++      - password=kirim-dev-password
++
++configMapGenerator:
++  - name: kirim-api-config
++    literals:
++      - SPRING_DATASOURCE_URL=jdbc:postgresql://postgres:5432/kirim
++      - SPRING_KAFKA_BOOTSTRAP_SERVERS=kafka:9092
++      - SPRING_DATA_REDIS_HOST=redis
++      - SERVER_SHUTDOWN=graceful
++  - name: risk-service-config
++    literals:
++      - SPRING_DATASOURCE_URL=jdbc:postgresql://postgres:5432/kirim_risk
++      - SPRING_KAFKA_BOOTSTRAP_SERVERS=kafka:9092
++      - SERVER_SHUTDOWN=graceful
+diff --git a/deploy/k8s/base/namespace.yaml b/deploy/k8s/base/namespace.yaml
+new file mode 100644
+index 0000000..cc9b3cb
+--- /dev/null
++++ b/deploy/k8s/base/namespace.yaml
+@@ -0,0 +1,4 @@
++apiVersion: v1
++kind: Namespace
++metadata:
++  name: kirim
+diff --git a/deploy/k8s/base/postgres.yaml b/deploy/k8s/base/postgres.yaml
+new file mode 100644
+index 0000000..6b33436
+--- /dev/null
++++ b/deploy/k8s/base/postgres.yaml
+@@ -0,0 +1,98 @@
++# One PostgreSQL instance holding two databases: kirim (transfer API) and
++# kirim_risk (risk service). Each service only has the URL of its own database.
++# Production would use a managed database (Cloud SQL, RDS) or an operator such
++# as CloudNativePG, with backups and a replica.
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: postgres-init
++data:
++  01-create-risk-db.sql: |
++    CREATE DATABASE kirim_risk OWNER kirim;
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: postgres
++  labels:
++    app.kubernetes.io/name: postgres
++spec:
++  selector:
++    app.kubernetes.io/name: postgres
++  ports:
++    - name: postgres
++      port: 5432
++      targetPort: postgres
++---
++apiVersion: apps/v1
++kind: StatefulSet
++metadata:
++  name: postgres
++  labels:
++    app.kubernetes.io/name: postgres
++spec:
++  serviceName: postgres
++  replicas: 1
++  selector:
++    matchLabels:
++      app.kubernetes.io/name: postgres
++  template:
++    metadata:
++      labels:
++        app.kubernetes.io/name: postgres
++    spec:
++      containers:
++        - name: postgres
++          image: postgres:16-alpine
++          ports:
++            - name: postgres
++              containerPort: 5432
++          env:
++            - name: POSTGRES_DB
++              value: kirim
++            - name: POSTGRES_USER
++              valueFrom:
++                secretKeyRef:
++                  name: kirim-db
++                  key: username
++            - name: POSTGRES_PASSWORD
++              valueFrom:
++                secretKeyRef:
++                  name: kirim-db
++                  key: password
++            # A subdirectory, because the volume root contains lost+found.
++            - name: PGDATA
++              value: /var/lib/postgresql/data/pgdata
++          readinessProbe:
++            exec:
++              command: ["sh", "-c", "pg_isready -U \"$POSTGRES_USER\" -d kirim"]
++            periodSeconds: 5
++          livenessProbe:
++            exec:
++              command: ["sh", "-c", "pg_isready -U \"$POSTGRES_USER\" -d kirim"]
++            initialDelaySeconds: 30
++            periodSeconds: 10
++          resources:
++            requests:
++              cpu: 100m
++              memory: 256Mi
++            limits:
++              memory: 512Mi
++          volumeMounts:
++            - name: data
++              mountPath: /var/lib/postgresql/data
++            - name: init
++              mountPath: /docker-entrypoint-initdb.d
++              readOnly: true
++      volumes:
++        - name: init
++          configMap:
++            name: postgres-init
++  volumeClaimTemplates:
++    - metadata:
++        name: data
++      spec:
++        accessModes: ["ReadWriteOnce"]
++        resources:
++          requests:
++            storage: 2Gi
+diff --git a/deploy/k8s/base/redis.yaml b/deploy/k8s/base/redis.yaml
+new file mode 100644
+index 0000000..73685d3
+--- /dev/null
++++ b/deploy/k8s/base/redis.yaml
+@@ -0,0 +1,70 @@
++# Redis holds only disposable data (rate-limit counters with TTLs, cached
++# immutable transfers), so it runs without persistence. If it restarts empty,
++# the counters reset and the cache refills from PostgreSQL.
++apiVersion: v1
++kind: Service
++metadata:
++  name: redis
++  labels:
++    app.kubernetes.io/name: redis
++spec:
++  selector:
++    app.kubernetes.io/name: redis
++  ports:
++    - name: redis
++      port: 6379
++      targetPort: redis
++---
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: redis
++  labels:
++    app.kubernetes.io/name: redis
++spec:
++  replicas: 1
++  selector:
++    matchLabels:
++      app.kubernetes.io/name: redis
++  template:
++    metadata:
++      labels:
++        app.kubernetes.io/name: redis
++    spec:
++      containers:
++        - name: redis
++          image: redis:7-alpine
++          args:
++            - --save
++            - ""
++            - --appendonly
++            - "no"
++            - --maxmemory
++            - 128mb
++            # Every key has a TTL, so evict the ones closest to expiring first.
++            - --maxmemory-policy
++            - volatile-ttl
++          ports:
++            - name: redis
++              containerPort: 6379
++          readinessProbe:
++            exec:
++              command: ["redis-cli", "ping"]
++            periodSeconds: 5
++          livenessProbe:
++            tcpSocket:
++              port: redis
++            initialDelaySeconds: 10
++            periodSeconds: 10
++          resources:
++            requests:
++              cpu: 50m
++              memory: 64Mi
++            limits:
++              memory: 192Mi
++          securityContext:
++            runAsNonRoot: true
++            runAsUser: 999
++            allowPrivilegeEscalation: false
++            capabilities:
++              drop: ["ALL"]
+diff --git a/deploy/k8s/base/risk-service.yaml b/deploy/k8s/base/risk-service.yaml
+new file mode 100644
+index 0000000..14742de
+--- /dev/null
++++ b/deploy/k8s/base/risk-service.yaml
+@@ -0,0 +1,93 @@
++# The risk service (Java). It can scale up to the number of partitions of
++# transfer-events (3); Kafka splits the partitions across the replicas.
++apiVersion: v1
++kind: Service
++metadata:
++  name: risk-service
++  labels:
++    app.kubernetes.io/name: risk-service
++spec:
++  selector:
++    app.kubernetes.io/name: risk-service
++  ports:
++    - name: http
++      port: 80
++      targetPort: http
++---
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: risk-service
++  labels:
++    app.kubernetes.io/name: risk-service
++spec:
++  replicas: 1
++  selector:
++    matchLabels:
++      app.kubernetes.io/name: risk-service
++  template:
++    metadata:
++      labels:
++        app.kubernetes.io/name: risk-service
++      annotations:
++        prometheus.io/scrape: "true"
++        prometheus.io/path: /actuator/prometheus
++        prometheus.io/port: "8081"
++    spec:
++      terminationGracePeriodSeconds: 40
++      containers:
++        - name: risk
++          image: kirim-risk-service
++          imagePullPolicy: IfNotPresent
++          ports:
++            - name: http
++              containerPort: 8081
++          envFrom:
++            - configMapRef:
++                name: risk-service-config
++          env:
++            - name: SPRING_DATASOURCE_USERNAME
++              valueFrom:
++                secretKeyRef:
++                  name: kirim-db
++                  key: username
++            - name: SPRING_DATASOURCE_PASSWORD
++              valueFrom:
++                secretKeyRef:
++                  name: kirim-db
++                  key: password
++          startupProbe:
++            httpGet:
++              path: /actuator/health/liveness
++              port: http
++            periodSeconds: 5
++            failureThreshold: 30
++          livenessProbe:
++            httpGet:
++              path: /actuator/health/liveness
++              port: http
++            periodSeconds: 10
++          readinessProbe:
++            httpGet:
++              path: /actuator/health/readiness
++              port: http
++            periodSeconds: 5
++          resources:
++            requests:
++              cpu: 100m
++              memory: 384Mi
++            limits:
++              memory: 512Mi
++          securityContext:
++            runAsNonRoot: true
++            runAsUser: 1001
++            allowPrivilegeEscalation: false
++            readOnlyRootFilesystem: true
++            capabilities:
++              drop: ["ALL"]
++          volumeMounts:
++            - name: tmp
++              mountPath: /tmp
++      volumes:
++        - name: tmp
++          emptyDir: {}
+diff --git a/deploy/k8s/overlays/gitlab/kustomization.yaml b/deploy/k8s/overlays/gitlab/kustomization.yaml
+new file mode 100644
+index 0000000..e6de597
+--- /dev/null
++++ b/deploy/k8s/overlays/gitlab/kustomization.yaml
+@@ -0,0 +1,19 @@
++# Used by the GitLab CI deploy job. The job appends an `images:` block that
++# points at this commit's images in the GitLab Container Registry, e.g.
++#   registry.gitlab.com/<group>/kirim/api:<short-sha>
++apiVersion: kustomize.config.k8s.io/v1beta1
++kind: Kustomization
++
++resources:
++  - ../../base
++
++# The registry is private: pods pull with a secret the deploy job creates.
++patches:
++  - target:
++      kind: Deployment
++      name: kirim-api|risk-service
++    patch: |-
++      - op: add
++        path: /spec/template/spec/imagePullSecrets
++        value:
++          - name: gitlab-registry
+diff --git a/deploy/k8s/overlays/local/kustomization.yaml b/deploy/k8s/overlays/local/kustomization.yaml
+new file mode 100644
+index 0000000..d39a4cf
+--- /dev/null
++++ b/deploy/k8s/overlays/local/kustomization.yaml
+@@ -0,0 +1,26 @@
++# For a local kind cluster. Build the images, load them into kind, apply:
++#   docker build -t kirim-api:dev ./backend
++#   docker build -t kirim-risk-service:dev ./risk-service
++#   kind load docker-image kirim-api:dev kirim-risk-service:dev
++#   kubectl apply -k deploy/k8s/overlays/local
++apiVersion: kustomize.config.k8s.io/v1beta1
++kind: Kustomization
++
++resources:
++  - ../../base
++
++images:
++  - name: kirim-api
++    newTag: dev
++  - name: kirim-risk-service
++    newTag: dev
++
++# One API pod is enough on a laptop.
++patches:
++  - target:
++      kind: Deployment
++      name: kirim-api
++    patch: |-
++      - op: replace
++        path: /spec/replicas
++        value: 1
+diff --git a/deploy/postgres/01-create-risk-db.sql b/deploy/postgres/01-create-risk-db.sql
+new file mode 100644
+index 0000000..2c7b2c0
+--- /dev/null
++++ b/deploy/postgres/01-create-risk-db.sql
+@@ -0,0 +1,3 @@
++-- Runs once, when the PostgreSQL volume is first created (docker-compose).
++-- The risk service gets its own database; it never reads the transfer tables.
++CREATE DATABASE kirim_risk OWNER kirim;
+diff --git a/docker-compose.yml b/docker-compose.yml
+index c192985..54cadf4 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -1,6 +1,8 @@
+ # Local stack.
+-#   docker compose up -d postgres kafka      -> infra only, run the API from your IDE
+-#   docker compose up --build                -> everything, API on http://localhost:8080
++#   docker compose up -d postgres kafka redis   -> infra only, run the services from your IDE
++#   docker compose up --build                   -> everything: API on :8080, risk service on :8081
++# If you created the postgres volume before the risk service existed, run
++# `docker compose down -v` once so the kirim_risk database gets created.
+ services:
+   postgres:
+     image: postgres:16-alpine
+@@ -10,6 +12,8 @@ services:
+       POSTGRES_PASSWORD: kirim
+     ports:
+       - "5433:5432"
++    volumes:
++      - ./deploy/postgres:/docker-entrypoint-initdb.d:ro
+     healthcheck:
+       test: ["CMD-SHELL", "pg_isready -U kirim"]
+       interval: 5s
+@@ -37,6 +41,16 @@ services:
+       interval: 5s
+       retries: 20
+ 
++  redis:
++    image: redis:7-alpine
++    command: ["redis-server", "--save", "", "--appendonly", "no"]
++    ports:
++      - "6379:6379"
++    healthcheck:
++      test: ["CMD", "redis-cli", "ping"]
++      interval: 5s
++      retries: 10
++
+   api:
+     build: ./backend
+     ports:
+@@ -44,6 +58,22 @@ services:
+     environment:
+       SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/kirim
+       SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:19092
++      SPRING_DATA_REDIS_HOST: redis
++    depends_on:
++      postgres:
++        condition: service_healthy
++      kafka:
++        condition: service_healthy
++      redis:
++        condition: service_healthy
++
++  risk-service:
++    build: ./risk-service
++    ports:
++      - "8081:8081"
++    environment:
++      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/kirim_risk
++      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:19092
+     depends_on:
+       postgres:
+         condition: service_healthy
+diff --git a/docs/adr/0004-redis-rate-limit-and-cache.md b/docs/adr/0004-redis-rate-limit-and-cache.md
+new file mode 100644
+index 0000000..5dec2be
+--- /dev/null
++++ b/docs/adr/0004-redis-rate-limit-and-cache.md
+@@ -0,0 +1,26 @@
++# ADR 0004: Redis for rate limiting and caching, not for correctness
++
++**Status:** accepted
++
++## Context
++Two needs came up once the API could run as several replicas:
++1. **Abuse protection.** A compromised session or a buggy client can fire hundreds of transfers a minute from one account. Balance and per-transfer limits stop money from going negative, but not the flood itself.
++2. **Cheap reads.** `GET /transfers/{id}` is called on every retry and status poll, and each call hits PostgreSQL.
++
++An in-memory limiter or cache would be per-pod: with 2 replicas, a client gets 2x the limit and each pod has its own cache. The state has to be shared, so it lives in Redis.
++
++## Decision
++- **Rate limit:** fixed window per source account (`kirim:rl:transfers:{account}:{window}`), default 10 new transfers per minute. `INCR` + `EXPIRE` run in one Lua script, so a counter can never be left without a TTL. Over the limit: `429` with `Retry-After`.
++- The check runs **after** the idempotency key is reserved, so replays of an earlier request use no quota, and a `429` rolls back the reservation so the client can retry later with the same key.
++- **Cache:** cache-aside for transfers only, TTL 10 minutes. Transfers are immutable once committed, so there is nothing to invalidate. Balances are **not** cached: they change on every transfer and a stale balance in a bank is a bug.
++- Entries are written on the read path only, never inside the write transaction (which could still roll back).
++- **Redis is never the source of truth.** Idempotency stays in PostgreSQL (see ADR 0001: Redis can't be atomic with the PostgreSQL write).
++
++## Failure behaviour
++- Redis down → the limiter **fails open** by default (`kirim.rate-limit.fail-open`), cache reads fall through to PostgreSQL. Transfers keep working; money rules are still enforced by PostgreSQL. Set `fail-open: false` to reject with `503` instead, if abuse protection matters more than availability.
++- Redis timeouts are 500 ms, because the limiter call happens while the idempotency row lock is held.
++- Redis is excluded from the Kubernetes readiness probe, so a Redis outage doesn't take every API pod out of the Service.
++
++## Consequences
++- Fixed windows allow up to 2x the limit across a window boundary. Acceptable for a guard rail; a sliding window or token bucket is the upgrade path.
++- Redis runs without persistence: a restart resets counters and empties the cache, which is harmless.
+diff --git a/docs/adr/0005-risk-service-in-java.md b/docs/adr/0005-risk-service-in-java.md
+new file mode 100644
+index 0000000..400b240
+--- /dev/null
++++ b/docs/adr/0005-risk-service-in-java.md
+@@ -0,0 +1,19 @@
++# ADR 0005: A separate risk service, in Java, fed only by Kafka
++
++**Status:** accepted
++
++## Context
++Banks must watch for suspicious activity (AML): unusually large transfers, accounts sending a lot in one day, sudden bursts of transfers. Putting these checks inside the transfer transaction would slow every transfer and couple two very different concerns: moving money correctly vs. analysing behaviour.
++
++## Decision
++- A new service, `risk-service`, written in **Java 21 / Spring Boot**, consumes `transfer-events` in its **own consumer group** (`kirim-risk`). It receives every event independently of the notification consumer.
++- **Database per service:** it has its own database (`kirim_risk`) and never reads the transfer service's tables. Its only input is the event contract.
++- Rules are a pure function (`RiskRules`) with unit tests: `LARGE_TRANSFER`, `DAILY_TOTAL_EXCEEDED`, `HIGH_DAILY_COUNT`. Daily rules fire **once**, on the transfer that crosses the threshold, so one busy account doesn't flood the alert queue.
++- Days are bucketed in `Asia/Jakarta`, not UTC: a transfer at 01:00 WIB belongs to that WIB day.
++- Daily totals are updated with one atomic upsert (`INSERT ... ON CONFLICT DO UPDATE ... RETURNING`), so concurrent consumers can't lose an increment.
++- Same reliability pattern as the notification consumer: dedupe on `eventId` in the same transaction, retries with backoff, then its **own** dead-letter topic `transfer-events-risk-dlt`.
++- The event DTO uses strings for `type`/`status`, and unknown fields are ignored, so the producer can evolve without breaking this consumer.
++
++## Consequences
++- Alerts are **after the fact** (milliseconds to seconds later); this service detects, it does not block. Blocking a transfer in real time would need a synchronous check in the transfer path, with its own latency and availability trade-offs.
++- Two languages in one repo. That is deliberate here (Kotlin and Java both run on the JVM and use the same Spring stack) and mirrors teams where services are owned by different groups.
+diff --git a/docs/adr/0006-kubernetes-and-gitlab-ci.md b/docs/adr/0006-kubernetes-and-gitlab-ci.md
+new file mode 100644
+index 0000000..c22ca5e
+--- /dev/null
++++ b/docs/adr/0006-kubernetes-and-gitlab-ci.md
+@@ -0,0 +1,20 @@
++# ADR 0006: Kubernetes manifests with Kustomize, delivered by GitLab CI
++
++**Status:** accepted
++
++## Decision
++- Plain Kubernetes YAML in `deploy/k8s/base`, with **Kustomize overlays** (`local` for kind, `gitlab` for the CI deploy). No Helm: there is one app and two environments, and plain manifests are easier to review.
++- The API runs **2 replicas**, which the design already allows (outbox `SKIP LOCKED`, Redis-shared rate limits, Kafka consumer groups). A `PodDisruptionBudget` keeps one pod during node drains; rolling updates use `maxUnavailable: 0`.
++- Probes use Spring Boot's liveness/readiness groups. A **startup probe** covers JVM start and Flyway migrations, so slow starts don't trigger restarts.
++- Containers run as non-root with a read-only root filesystem (`/tmp` is an `emptyDir`) and no Linux capabilities.
++- Secrets are generated by Kustomize from **development-only** literals. A real cluster would use a secret manager (External Secrets, Sealed Secrets, Vault).
++- PostgreSQL, Kafka and Redis run in-cluster as single instances for development. Production would use managed services or operators (CloudNativePG, Strimzi) with replication.
++
++## GitLab CI
++- `test`: both Gradle builds with Testcontainers on Docker-in-Docker, the web build, and a manifest render check.
++- `build` (default branch): Docker images tagged with the **commit SHA**, pushed to the GitLab Container Registry.
++- `deploy` (manual): via the GitLab agent for Kubernetes. The job pins the overlay to this commit's images, applies it, and waits for `rollout status`, so a crash-looping release fails the pipeline.
++
++## Consequences
++- Rollback = re-run the deploy job of an earlier pipeline (images are immutable SHA tags).
++- GitHub Actions stays as the CI for the GitHub mirror; both pipelines run the same Gradle and npm commands.
+diff --git a/risk-service/.dockerignore b/risk-service/.dockerignore
+new file mode 100644
+index 0000000..dc8c423
+--- /dev/null
++++ b/risk-service/.dockerignore
+@@ -0,0 +1,3 @@
++.gradle
++build
++.kotlin
+diff --git a/risk-service/Dockerfile b/risk-service/Dockerfile
+new file mode 100644
+index 0000000..6f53110
+--- /dev/null
++++ b/risk-service/Dockerfile
+@@ -0,0 +1,15 @@
++FROM eclipse-temurin:21-jdk AS build
++WORKDIR /app
++COPY gradlew settings.gradle.kts build.gradle.kts ./
++COPY gradle gradle
++RUN chmod +x gradlew && ./gradlew --no-daemon dependencies > /dev/null
++COPY src src
++RUN ./gradlew --no-daemon bootJar -x test
++
++FROM eclipse-temurin:21-jre
++WORKDIR /app
++RUN useradd --system --uid 1001 kirim
++USER kirim
++COPY --from=build /app/build/libs/app.jar app.jar
++EXPOSE 8081
++ENTRYPOINT ["java", "-XX:MaxRAMPercentage=75", "-jar", "app.jar"]
+diff --git a/risk-service/build.gradle.kts b/risk-service/build.gradle.kts
+new file mode 100644
+index 0000000..fcaae5e
+--- /dev/null
++++ b/risk-service/build.gradle.kts
+@@ -0,0 +1,58 @@
++plugins {
++    java
++    id("org.springframework.boot") version "3.5.6"
++    id("io.spring.dependency-management") version "1.1.7"
++}
++
++group = "dev.rendy"
++version = "0.1.0"
++
++java {
++    toolchain {
++        languageVersion = JavaLanguageVersion.of(21)
++    }
++}
++
++repositories {
++    mavenCentral()
++}
++
++// Docker Engine 29 requires API >= 1.44; Testcontainers < 1.21.4 can't talk to it.
++extra["testcontainers.version"] = "1.21.4"
++
++dependencies {
++    implementation("org.springframework.boot:spring-boot-starter-web")
++    implementation("org.springframework.boot:spring-boot-starter-jdbc")
++    implementation("org.springframework.boot:spring-boot-starter-actuator")
++    implementation("org.springframework.kafka:spring-kafka")
++    implementation("org.flywaydb:flyway-core")
++    implementation("org.flywaydb:flyway-database-postgresql")
++    implementation("org.springdoc:springdoc-openapi-starter-webmvc-ui:2.8.9")
++
++    runtimeOnly("org.postgresql:postgresql")
++    runtimeOnly("io.micrometer:micrometer-registry-prometheus")
++
++    testImplementation("org.springframework.boot:spring-boot-starter-test")
++    testImplementation("org.springframework.boot:spring-boot-testcontainers")
++    testImplementation("org.springframework.kafka:spring-kafka-test")
++    testImplementation("org.testcontainers:junit-jupiter")
++    testImplementation("org.testcontainers:postgresql")
++    testImplementation("org.testcontainers:kafka")
++    testImplementation("org.awaitility:awaitility")
++    testRuntimeOnly("org.junit.platform:junit-platform-launcher")
++}
++
++tasks.withType<Test> {
++    useJUnitPlatform()
++    testLogging {
++        events("passed", "skipped", "failed")
++    }
++}
++
++tasks.bootJar {
++    archiveFileName.set("app.jar")
++}
++
++tasks.jar {
++    enabled = false
++}
+diff --git a/risk-service/gradle/wrapper/gradle-wrapper.jar b/risk-service/gradle/wrapper/gradle-wrapper.jar
+new file mode 100644
+index 0000000000000000000000000000000000000000..1b33c55baabb587c669f562ae36f953de2481846
+GIT binary patch
+literal 43764
+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
+z8RF{n%ouSp0gNT|g-GkrG)9%0Dh<dNX1S!$*m&;|5ODL6QwAmZ!{!ahS37fkGg@+c
+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
+K0Q#OFKm8BJ5$)0d
+
+literal 0
+HcmV?d00001
+
+diff --git a/risk-service/gradle/wrapper/gradle-wrapper.properties b/risk-service/gradle/wrapper/gradle-wrapper.properties
+new file mode 100644
+index 0000000..d4081da
+--- /dev/null
++++ b/risk-service/gradle/wrapper/gradle-wrapper.properties
+@@ -0,0 +1,7 @@
++distributionBase=GRADLE_USER_HOME
++distributionPath=wrapper/dists
++distributionUrl=https\://services.gradle.org/distributions/gradle-8.14.3-bin.zip
++networkTimeout=10000
++validateDistributionUrl=true
++zipStoreBase=GRADLE_USER_HOME
++zipStorePath=wrapper/dists
+diff --git a/risk-service/gradlew b/risk-service/gradlew
+new file mode 100755
+index 0000000..23d15a9
+--- /dev/null
++++ b/risk-service/gradlew
+@@ -0,0 +1,251 @@
++#!/bin/sh
++
++#
++# Copyright © 2015-2021 the original authors.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#      https://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++#
++# SPDX-License-Identifier: Apache-2.0
++#
++
++##############################################################################
++#
++#   Gradle start up script for POSIX generated by Gradle.
++#
++#   Important for running:
++#
++#   (1) You need a POSIX-compliant shell to run this script. If your /bin/sh is
++#       noncompliant, but you have some other compliant shell such as ksh or
++#       bash, then to run this script, type that shell name before the whole
++#       command line, like:
++#
++#           ksh Gradle
++#
++#       Busybox and similar reduced shells will NOT work, because this script
++#       requires all of these POSIX shell features:
++#         * functions;
++#         * expansions «$var», «${var}», «${var:-default}», «${var+SET}»,
++#           «${var#prefix}», «${var%suffix}», and «$( cmd )»;
++#         * compound commands having a testable exit status, especially «case»;
++#         * various built-in commands including «command», «set», and «ulimit».
++#
++#   Important for patching:
++#
++#   (2) This script targets any POSIX shell, so it avoids extensions provided
++#       by Bash, Ksh, etc; in particular arrays are avoided.
++#
++#       The "traditional" practice of packing multiple parameters into a
++#       space-separated string is a well documented source of bugs and security
++#       problems, so this is (mostly) avoided, by progressively accumulating
++#       options in "$@", and eventually passing that to Java.
++#
++#       Where the inherited environment variables (DEFAULT_JVM_OPTS, JAVA_OPTS,
++#       and GRADLE_OPTS) rely on word-splitting, this is performed explicitly;
++#       see the in-line comments for details.
++#
++#       There are tweaks for specific operating systems such as AIX, CygWin,
++#       Darwin, MinGW, and NonStop.
++#
++#   (3) This script is generated from the Groovy template
++#       https://github.com/gradle/gradle/blob/HEAD/platforms/jvm/plugins-application/src/main/resources/org/gradle/api/internal/plugins/unixStartScript.txt
++#       within the Gradle project.
++#
++#       You can find Gradle at https://github.com/gradle/gradle/.
++#
++##############################################################################
++
++# Attempt to set APP_HOME
++
++# Resolve links: $0 may be a link
++app_path=$0
++
++# Need this for daisy-chained symlinks.
++while
++    APP_HOME=${app_path%"${app_path##*/}"}  # leaves a trailing /; empty if no leading path
++    [ -h "$app_path" ]
++do
++    ls=$( ls -ld "$app_path" )
++    link=${ls#*' -> '}
++    case $link in             #(
++      /*)   app_path=$link ;; #(
++      *)    app_path=$APP_HOME$link ;;
++    esac
++done
++
++# This is normally unused
++# shellcheck disable=SC2034
++APP_BASE_NAME=${0##*/}
++# Discard cd standard output in case $CDPATH is set (https://github.com/gradle/gradle/issues/25036)
++APP_HOME=$( cd -P "${APP_HOME:-./}" > /dev/null && printf '%s\n' "$PWD" ) || exit
++
++# Use the maximum available, or set MAX_FD != -1 to use that value.
++MAX_FD=maximum
++
++warn () {
++    echo "$*"
++} >&2
++
++die () {
++    echo
++    echo "$*"
++    echo
++    exit 1
++} >&2
++
++# OS specific support (must be 'true' or 'false').
++cygwin=false
++msys=false
++darwin=false
++nonstop=false
++case "$( uname )" in                #(
++  CYGWIN* )         cygwin=true  ;; #(
++  Darwin* )         darwin=true  ;; #(
++  MSYS* | MINGW* )  msys=true    ;; #(
++  NONSTOP* )        nonstop=true ;;
++esac
++
++CLASSPATH="\\\"\\\""
++
++
++# Determine the Java command to use to start the JVM.
++if [ -n "$JAVA_HOME" ] ; then
++    if [ -x "$JAVA_HOME/jre/sh/java" ] ; then
++        # IBM's JDK on AIX uses strange locations for the executables
++        JAVACMD=$JAVA_HOME/jre/sh/java
++    else
++        JAVACMD=$JAVA_HOME/bin/java
++    fi
++    if [ ! -x "$JAVACMD" ] ; then
++        die "ERROR: JAVA_HOME is set to an invalid directory: $JAVA_HOME
++
++Please set the JAVA_HOME variable in your environment to match the
++location of your Java installation."
++    fi
++else
++    JAVACMD=java
++    if ! command -v java >/dev/null 2>&1
++    then
++        die "ERROR: JAVA_HOME is not set and no 'java' command could be found in your PATH.
++
++Please set the JAVA_HOME variable in your environment to match the
++location of your Java installation."
++    fi
++fi
++
++# Increase the maximum file descriptors if we can.
++if ! "$cygwin" && ! "$darwin" && ! "$nonstop" ; then
++    case $MAX_FD in #(
++      max*)
++        # In POSIX sh, ulimit -H is undefined. That's why the result is checked to see if it worked.
++        # shellcheck disable=SC2039,SC3045
++        MAX_FD=$( ulimit -H -n ) ||
++            warn "Could not query maximum file descriptor limit"
++    esac
++    case $MAX_FD in  #(
++      '' | soft) :;; #(
++      *)
++        # In POSIX sh, ulimit -n is undefined. That's why the result is checked to see if it worked.
++        # shellcheck disable=SC2039,SC3045
++        ulimit -n "$MAX_FD" ||
++            warn "Could not set maximum file descriptor limit to $MAX_FD"
++    esac
++fi
++
++# Collect all arguments for the java command, stacking in reverse order:
++#   * args from the command line
++#   * the main class name
++#   * -classpath
++#   * -D...appname settings
++#   * --module-path (only if needed)
++#   * DEFAULT_JVM_OPTS, JAVA_OPTS, and GRADLE_OPTS environment variables.
++
++# For Cygwin or MSYS, switch paths to Windows format before running java
++if "$cygwin" || "$msys" ; then
++    APP_HOME=$( cygpath --path --mixed "$APP_HOME" )
++    CLASSPATH=$( cygpath --path --mixed "$CLASSPATH" )
++
++    JAVACMD=$( cygpath --unix "$JAVACMD" )
++
++    # Now convert the arguments - kludge to limit ourselves to /bin/sh
++    for arg do
++        if
++            case $arg in                                #(
++              -*)   false ;;                            # don't mess with options #(
++              /?*)  t=${arg#/} t=/${t%%/*}              # looks like a POSIX filepath
++                    [ -e "$t" ] ;;                      #(
++              *)    false ;;
++            esac
++        then
++            arg=$( cygpath --path --ignore --mixed "$arg" )
++        fi
++        # Roll the args list around exactly as many times as the number of
++        # args, so each arg winds up back in the position where it started, but
++        # possibly modified.
++        #
++        # NB: a `for` loop captures its iteration list before it begins, so
++        # changing the positional parameters here affects neither the number of
++        # iterations, nor the values presented in `arg`.
++        shift                   # remove old arg
++        set -- "$@" "$arg"      # push replacement arg
++    done
++fi
++
++
++# Add default JVM options here. You can also use JAVA_OPTS and GRADLE_OPTS to pass JVM options to this script.
++DEFAULT_JVM_OPTS='"-Xmx64m" "-Xms64m"'
++
++# Collect all arguments for the java command:
++#   * DEFAULT_JVM_OPTS, JAVA_OPTS, and optsEnvironmentVar are not allowed to contain shell fragments,
++#     and any embedded shellness will be escaped.
++#   * For example: A user cannot expect ${Hostname} to be expanded, as it is an environment variable and will be
++#     treated as '${Hostname}' itself on the command line.
++
++set -- \
++        "-Dorg.gradle.appname=$APP_BASE_NAME" \
++        -classpath "$CLASSPATH" \
++        -jar "$APP_HOME/gradle/wrapper/gradle-wrapper.jar" \
++        "$@"
++
++# Stop when "xargs" is not available.
++if ! command -v xargs >/dev/null 2>&1
++then
++    die "xargs is not available"
++fi
++
++# Use "xargs" to parse quoted args.
++#
++# With -n1 it outputs one arg per line, with the quotes and backslashes removed.
++#
++# In Bash we could simply go:
++#
++#   readarray ARGS < <( xargs -n1 <<<"$var" ) &&
++#   set -- "${ARGS[@]}" "$@"
++#
++# but POSIX shell has neither arrays nor command substitution, so instead we
++# post-process each arg (as a line of input to sed) to backslash-escape any
++# character that might be a shell metacharacter, then use eval to reverse
++# that process (while maintaining the separation between arguments), and wrap
++# the whole thing up as a single "set" statement.
++#
++# This will of course break if any of these variables contains a newline or
++# an unmatched quote.
++#
++
++eval "set -- $(
++        printf '%s\n' "$DEFAULT_JVM_OPTS $JAVA_OPTS $GRADLE_OPTS" |
++        xargs -n1 |
++        sed ' s~[^-[:alnum:]+,./:=@_]~\\&~g; ' |
++        tr '\n' ' '
++    )" '"$@"'
++
++exec "$JAVACMD" "$@"
+diff --git a/risk-service/gradlew.bat b/risk-service/gradlew.bat
+new file mode 100644
+index 0000000..db3a6ac
+--- /dev/null
++++ b/risk-service/gradlew.bat
+@@ -0,0 +1,94 @@
++@rem
++@rem Copyright 2015 the original author or authors.
++@rem
++@rem Licensed under the Apache License, Version 2.0 (the "License");
++@rem you may not use this file except in compliance with the License.
++@rem You may obtain a copy of the License at
++@rem
++@rem      https://www.apache.org/licenses/LICENSE-2.0
++@rem
++@rem Unless required by applicable law or agreed to in writing, software
++@rem distributed under the License is distributed on an "AS IS" BASIS,
++@rem WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++@rem See the License for the specific language governing permissions and
++@rem limitations under the License.
++@rem
++@rem SPDX-License-Identifier: Apache-2.0
++@rem
++
++@if "%DEBUG%"=="" @echo off
++@rem ##########################################################################
++@rem
++@rem  Gradle startup script for Windows
++@rem
++@rem ##########################################################################
++
++@rem Set local scope for the variables with windows NT shell
++if "%OS%"=="Windows_NT" setlocal
++
++set DIRNAME=%~dp0
++if "%DIRNAME%"=="" set DIRNAME=.
++@rem This is normally unused
++set APP_BASE_NAME=%~n0
++set APP_HOME=%DIRNAME%
++
++@rem Resolve any "." and ".." in APP_HOME to make it shorter.
++for %%i in ("%APP_HOME%") do set APP_HOME=%%~fi
++
++@rem Add default JVM options here. You can also use JAVA_OPTS and GRADLE_OPTS to pass JVM options to this script.
++set DEFAULT_JVM_OPTS="-Xmx64m" "-Xms64m"
++
++@rem Find java.exe
++if defined JAVA_HOME goto findJavaFromJavaHome
++
++set JAVA_EXE=java.exe
++%JAVA_EXE% -version >NUL 2>&1
++if %ERRORLEVEL% equ 0 goto execute
++
++echo. 1>&2
++echo ERROR: JAVA_HOME is not set and no 'java' command could be found in your PATH. 1>&2
++echo. 1>&2
++echo Please set the JAVA_HOME variable in your environment to match the 1>&2
++echo location of your Java installation. 1>&2
++
++goto fail
++
++:findJavaFromJavaHome
++set JAVA_HOME=%JAVA_HOME:"=%
++set JAVA_EXE=%JAVA_HOME%/bin/java.exe
++
++if exist "%JAVA_EXE%" goto execute
++
++echo. 1>&2
++echo ERROR: JAVA_HOME is set to an invalid directory: %JAVA_HOME% 1>&2
++echo. 1>&2
++echo Please set the JAVA_HOME variable in your environment to match the 1>&2
++echo location of your Java installation. 1>&2
++
++goto fail
++
++:execute
++@rem Setup the command line
++
++set CLASSPATH=
++
++
++@rem Execute Gradle
++"%JAVA_EXE%" %DEFAULT_JVM_OPTS% %JAVA_OPTS% %GRADLE_OPTS% "-Dorg.gradle.appname=%APP_BASE_NAME%" -classpath "%CLASSPATH%" -jar "%APP_HOME%\gradle\wrapper\gradle-wrapper.jar" %*
++
++:end
++@rem End local scope for the variables with windows NT shell
++if %ERRORLEVEL% equ 0 goto mainEnd
++
++:fail
++rem Set variable GRADLE_EXIT_CONSOLE if you need the _script_ return code instead of
++rem the _cmd.exe /c_ return code!
++set EXIT_CODE=%ERRORLEVEL%
++if %EXIT_CODE% equ 0 set EXIT_CODE=1
++if not ""=="%GRADLE_EXIT_CONSOLE%" exit %EXIT_CODE%
++exit /b %EXIT_CODE%
++
++:mainEnd
++if "%OS%"=="Windows_NT" endlocal
++
++:omega
+diff --git a/risk-service/settings.gradle.kts b/risk-service/settings.gradle.kts
+new file mode 100644
+index 0000000..7865c70
+--- /dev/null
++++ b/risk-service/settings.gradle.kts
+@@ -0,0 +1,6 @@
++plugins {
++    // Lets Gradle download a JDK 21 automatically if one isn't installed.
++    id("org.gradle.toolchains.foojay-resolver-convention") version "1.0.0"
++}
++
++rootProject.name = "kirim-risk-service"
+diff --git a/risk-service/src/main/java/dev/rendy/kirim/risk/RiskService.java b/risk-service/src/main/java/dev/rendy/kirim/risk/RiskService.java
+new file mode 100644
+index 0000000..4458e40
+--- /dev/null
++++ b/risk-service/src/main/java/dev/rendy/kirim/risk/RiskService.java
+@@ -0,0 +1,69 @@
++package dev.rendy.kirim.risk;
++
++import dev.rendy.kirim.risk.event.TransferEvent;
++import dev.rendy.kirim.risk.rules.DailyActivity;
++import dev.rendy.kirim.risk.rules.RiskProperties;
++import dev.rendy.kirim.risk.rules.RiskRules;
++import dev.rendy.kirim.risk.store.Alert;
++import dev.rendy.kirim.risk.store.RiskRepository;
++import io.micrometer.core.instrument.MeterRegistry;
++import java.time.Clock;
++import java.time.Instant;
++import java.time.LocalDate;
++import java.time.ZoneId;
++import java.util.UUID;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.stereotype.Service;
++import org.springframework.transaction.annotation.Transactional;
++
++@Service
++public class RiskService {
++
++    private static final Logger log = LoggerFactory.getLogger(RiskService.class);
++
++    private final RiskRepository repository;
++    private final RiskProperties props;
++    private final ZoneId zone;
++    private final Clock clock;
++    private final MeterRegistry meters;
++
++    public RiskService(RiskRepository repository, RiskProperties props, Clock clock, MeterRegistry meters) {
++        this.repository = repository;
++        this.props = props;
++        this.zone = ZoneId.of(props.zone());
++        this.clock = clock;
++        this.meters = meters;
++    }
++
++    /**
++     * One transaction: dedupe on eventId, update the daily totals, store any alerts.
++     * If anything fails, all of it rolls back and Kafka redelivers the message, so
++     * a total is never counted twice or half-updated.
++     */
++    @Transactional
++    public void handle(TransferEvent event) {
++        if (!event.isCompleted()) {
++            return; // rejected transfers moved no money
++        }
++        Instant now = clock.instant();
++        if (!repository.markProcessed(event.eventId(), now)) {
++            log.info("Skipping duplicate event {}", event.eventId());
++            meters.counter("kirim.risk.events", "result", "duplicate").increment();
++            return;
++        }
++
++        LocalDate day = RiskRules.businessDay(event.occurredAt(), zone);
++        DailyActivity activity = repository.addOutgoing(event.fromAccountId(), day, event.amount());
++
++        for (RiskRules.Finding finding : RiskRules.evaluate(event.amount(), activity, props)) {
++            repository.insertAlert(new Alert(
++                    UUID.randomUUID(), event.eventId(), event.transferId(), event.fromAccountId(),
++                    finding.rule(), event.amount(), finding.details(), now));
++            meters.counter("kirim.risk.alerts", "rule", finding.rule().name()).increment();
++            log.warn("Risk alert {} for account {} on transfer {}: {}",
++                    finding.rule(), event.fromAccountId(), event.transferId(), finding.details());
++        }
++        meters.counter("kirim.risk.events", "result", "processed").increment();
++    }
++}
+diff --git a/risk-service/src/main/java/dev/rendy/kirim/risk/RiskServiceApplication.java b/risk-service/src/main/java/dev/rendy/kirim/risk/RiskServiceApplication.java
+new file mode 100644
+index 0000000..9b9631a
+--- /dev/null
++++ b/risk-service/src/main/java/dev/rendy/kirim/risk/RiskServiceApplication.java
+@@ -0,0 +1,20 @@
++package dev.rendy.kirim.risk;
++
++import org.springframework.boot.SpringApplication;
++import org.springframework.boot.autoconfigure.SpringBootApplication;
++import org.springframework.boot.context.properties.ConfigurationPropertiesScan;
++
++/**
++ * Kirim risk service: watches transfer events and raises AML-style alerts
++ * (large transfers, daily totals, daily counts). It is a separate service
++ * written in Java that shares nothing with the transfer API except the
++ * Kafka topic and the event contract.
++ */
++@SpringBootApplication
++@ConfigurationPropertiesScan
++public class RiskServiceApplication {
++
++    public static void main(String[] args) {
++        SpringApplication.run(RiskServiceApplication.class, args);
++    }
++}
+diff --git a/risk-service/src/main/java/dev/rendy/kirim/risk/api/AlertController.java b/risk-service/src/main/java/dev/rendy/kirim/risk/api/AlertController.java
+new file mode 100644
+index 0000000..b38180e
+--- /dev/null
++++ b/risk-service/src/main/java/dev/rendy/kirim/risk/api/AlertController.java
+@@ -0,0 +1,51 @@
++package dev.rendy.kirim.risk.api;
++
++import dev.rendy.kirim.risk.rules.DailyActivity;
++import dev.rendy.kirim.risk.rules.RiskProperties;
++import dev.rendy.kirim.risk.store.Alert;
++import dev.rendy.kirim.risk.store.RiskRepository;
++import java.time.Clock;
++import java.time.LocalDate;
++import java.time.ZoneId;
++import java.util.List;
++import java.util.UUID;
++import org.springframework.format.annotation.DateTimeFormat;
++import org.springframework.web.bind.annotation.GetMapping;
++import org.springframework.web.bind.annotation.PathVariable;
++import org.springframework.web.bind.annotation.RequestMapping;
++import org.springframework.web.bind.annotation.RequestParam;
++import org.springframework.web.bind.annotation.RestController;
++
++@RestController
++@RequestMapping("/api/v1")
++public class AlertController {
++
++    public record DailyActivityResponse(UUID accountId, LocalDate day, long totalAmount, int transferCount) {
++    }
++
++    private final RiskRepository repository;
++    private final ZoneId zone;
++    private final Clock clock;
++
++    public AlertController(RiskRepository repository, RiskProperties props, Clock clock) {
++        this.repository = repository;
++        this.zone = ZoneId.of(props.zone());
++        this.clock = clock;
++    }
++
++    /** Newest alerts first; optionally for one account. */
++    @GetMapping("/alerts")
++    public List<Alert> alerts(@RequestParam(required = false) UUID accountId) {
++        return accountId == null ? repository.findRecentAlerts() : repository.findAlertsByAccount(accountId);
++    }
++
++    /** What an account has sent on a business day (default: today in the configured zone). */
++    @GetMapping("/accounts/{accountId}/daily-activity")
++    public DailyActivityResponse dailyActivity(
++            @PathVariable UUID accountId,
++            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate day) {
++        LocalDate date = day != null ? day : LocalDate.now(clock.withZone(zone));
++        DailyActivity activity = repository.findDaily(accountId, date).orElse(new DailyActivity(0, 0));
++        return new DailyActivityResponse(accountId, date, activity.totalAmount(), activity.transferCount());
++    }
++}
+diff --git a/risk-service/src/main/java/dev/rendy/kirim/risk/config/AppConfig.java b/risk-service/src/main/java/dev/rendy/kirim/risk/config/AppConfig.java
+new file mode 100644
+index 0000000..b80a814
+--- /dev/null
++++ b/risk-service/src/main/java/dev/rendy/kirim/risk/config/AppConfig.java
+@@ -0,0 +1,24 @@
++package dev.rendy.kirim.risk.config;
++
++import io.swagger.v3.oas.models.OpenAPI;
++import io.swagger.v3.oas.models.info.Info;
++import java.time.Clock;
++import org.springframework.context.annotation.Bean;
++import org.springframework.context.annotation.Configuration;
++
++@Configuration
++public class AppConfig {
++
++    @Bean
++    public Clock clock() {
++        return Clock.systemUTC();
++    }
++
++    @Bean
++    public OpenAPI openApi() {
++        return new OpenAPI().info(new Info()
++                .title("Kirim Risk API")
++                .version("v1")
++                .description("AML-style alerts built from transfer events."));
++    }
++}
+diff --git a/risk-service/src/main/java/dev/rendy/kirim/risk/config/KafkaConfig.java b/risk-service/src/main/java/dev/rendy/kirim/risk/config/KafkaConfig.java
+new file mode 100644
+index 0000000..949f2a8
+--- /dev/null
++++ b/risk-service/src/main/java/dev/rendy/kirim/risk/config/KafkaConfig.java
+@@ -0,0 +1,58 @@
++package dev.rendy.kirim.risk.config;
++
++import com.fasterxml.jackson.core.JsonProcessingException;
++import dev.rendy.kirim.risk.event.InvalidEventException;
++import dev.rendy.kirim.risk.rules.RiskProperties;
++import org.apache.kafka.clients.admin.NewTopic;
++import org.apache.kafka.common.TopicPartition;
++import org.springframework.context.annotation.Bean;
++import org.springframework.context.annotation.Configuration;
++import org.springframework.kafka.config.TopicBuilder;
++import org.springframework.kafka.core.KafkaTemplate;
++import org.springframework.kafka.listener.DeadLetterPublishingRecoverer;
++import org.springframework.kafka.listener.DefaultErrorHandler;
++import org.springframework.util.backoff.ExponentialBackOff;
++
++@Configuration
++public class KafkaConfig {
++
++    private final RiskProperties props;
++
++    public KafkaConfig(RiskProperties props) {
++        this.props = props;
++    }
++
++    /** Declared here too so the service can start before the transfer service has created it. Same settings. */
++    @Bean
++    public NewTopic transferEventsTopic() {
++        return TopicBuilder.name(props.topic()).partitions(3).replicas(1).build();
++    }
++
++    /**
++     * This service's own dead-letter topic. Each consumer group gets its own, so a
++     * message that fails here is not mixed up with failures in the notification
++     * consumer. Same partition count as the source, because the recoverer keeps
++     * the original partition.
++     */
++    @Bean
++    public NewTopic riskDeadLetterTopic() {
++        return TopicBuilder.name(props.deadLetterTopic()).partitions(3).replicas(1).build();
++    }
++
++    /**
++     * Retry 0.5s, 1s, 2s, 4s, then park the message on the dead-letter topic so one
++     * bad message cannot block its partition. Messages that can never succeed
++     * (malformed JSON, missing fields) skip the retries.
++     * Spring Boot plugs this bean into the default listener container factory.
++     */
++    @Bean
++    public DefaultErrorHandler kafkaErrorHandler(KafkaTemplate<?, ?> template) {
++        var recoverer = new DeadLetterPublishingRecoverer(template,
++                (record, ex) -> new TopicPartition(props.deadLetterTopic(), record.partition()));
++        var backOff = new ExponentialBackOff(500L, 2.0);
++        backOff.setMaxElapsedTime(8_000L);
++        var handler = new DefaultErrorHandler(recoverer, backOff);
++        handler.addNotRetryableExceptions(JsonProcessingException.class, InvalidEventException.class);
++        return handler;
++    }
++}
+diff --git a/risk-service/src/main/java/dev/rendy/kirim/risk/event/InvalidEventException.java b/risk-service/src/main/java/dev/rendy/kirim/risk/event/InvalidEventException.java
+new file mode 100644
+index 0000000..7b9cfbf
+--- /dev/null
++++ b/risk-service/src/main/java/dev/rendy/kirim/risk/event/InvalidEventException.java
+@@ -0,0 +1,9 @@
++package dev.rendy.kirim.risk.event;
++
++/** A message that will never be processable. It goes straight to the dead-letter topic, without retries. */
++public class InvalidEventException extends RuntimeException {
++
++    public InvalidEventException(String message) {
++        super(message);
++    }
++}
+diff --git a/risk-service/src/main/java/dev/rendy/kirim/risk/event/TransferEvent.java b/risk-service/src/main/java/dev/rendy/kirim/risk/event/TransferEvent.java
+new file mode 100644
+index 0000000..ace6100
+--- /dev/null
++++ b/risk-service/src/main/java/dev/rendy/kirim/risk/event/TransferEvent.java
+@@ -0,0 +1,39 @@
++package dev.rendy.kirim.risk.event;
++
++import java.time.Instant;
++import java.util.UUID;
++
++/**
++ * The event published by the transfer service (see its outbox). Fields are kept
++ * as plain types (type and status as strings) so this service does not break
++ * when the producer adds a new enum value; unknown JSON fields are ignored.
++ */
++public record TransferEvent(
++        UUID eventId,
++        String type,
++        UUID transferId,
++        UUID fromAccountId,
++        UUID toAccountId,
++        long amount,
++        String currency,
++        String status,
++        String failureReason,
++        Instant occurredAt) {
++
++    public static final String TRANSFER_COMPLETED = "TRANSFER_COMPLETED";
++
++    public boolean isCompleted() {
++        return TRANSFER_COMPLETED.equals(type);
++    }
++
++    /** Throws {@link InvalidEventException} if a required field is missing. Such a message can never succeed. */
++    public TransferEvent requireValid() {
++        if (eventId == null || type == null || transferId == null || fromAccountId == null || occurredAt == null) {
++            throw new InvalidEventException("Transfer event is missing required fields: " + this);
++        }
++        if (amount <= 0) {
++            throw new InvalidEventException("Transfer event " + eventId + " has a non-positive amount");
++        }
++        return this;
++    }
++}
+diff --git a/risk-service/src/main/java/dev/rendy/kirim/risk/event/TransferEventListener.java b/risk-service/src/main/java/dev/rendy/kirim/risk/event/TransferEventListener.java
+new file mode 100644
+index 0000000..1878c0d
+--- /dev/null
++++ b/risk-service/src/main/java/dev/rendy/kirim/risk/event/TransferEventListener.java
+@@ -0,0 +1,31 @@
++package dev.rendy.kirim.risk.event;
++
++import com.fasterxml.jackson.core.JsonProcessingException;
++import com.fasterxml.jackson.databind.ObjectMapper;
++import dev.rendy.kirim.risk.RiskService;
++import org.apache.kafka.clients.consumer.ConsumerRecord;
++import org.springframework.kafka.annotation.KafkaListener;
++import org.springframework.stereotype.Component;
++
++/**
++ * Its own consumer group (kirim-risk), so it receives every transfer event
++ * independently of the notification consumer in the transfer service.
++ */
++@Component
++public class TransferEventListener {
++
++    private final ObjectMapper objectMapper;
++    private final RiskService riskService;
++
++    public TransferEventListener(ObjectMapper objectMapper, RiskService riskService) {
++        this.objectMapper = objectMapper;
++        this.riskService = riskService;
++    }
++
++    @KafkaListener(topics = "${risk.topic:transfer-events}", groupId = "kirim-risk")
++    public void onTransferEvent(ConsumerRecord<String, String> record) throws JsonProcessingException {
++        // Parsed outside the transaction: a malformed message fails before any DB work.
++        TransferEvent event = objectMapper.readValue(record.value(), TransferEvent.class).requireValid();
++        riskService.handle(event);
++    }
++}
+diff --git a/risk-service/src/main/java/dev/rendy/kirim/risk/rules/AlertRule.java b/risk-service/src/main/java/dev/rendy/kirim/risk/rules/AlertRule.java
+new file mode 100644
+index 0000000..276ff22
+--- /dev/null
++++ b/risk-service/src/main/java/dev/rendy/kirim/risk/rules/AlertRule.java
+@@ -0,0 +1,10 @@
++package dev.rendy.kirim.risk.rules;
++
++public enum AlertRule {
++    /** One transfer at or above the large-transfer threshold. */
++    LARGE_TRANSFER,
++    /** The account's outgoing total for the day reached the daily threshold. */
++    DAILY_TOTAL_EXCEEDED,
++    /** The account's number of transfers for the day reached the daily threshold. */
++    HIGH_DAILY_COUNT
++}
+diff --git a/risk-service/src/main/java/dev/rendy/kirim/risk/rules/DailyActivity.java b/risk-service/src/main/java/dev/rendy/kirim/risk/rules/DailyActivity.java
+new file mode 100644
+index 0000000..0d71b80
+--- /dev/null
++++ b/risk-service/src/main/java/dev/rendy/kirim/risk/rules/DailyActivity.java
+@@ -0,0 +1,5 @@
++package dev.rendy.kirim.risk.rules;
++
++/** An account's outgoing activity for one day, after the current transfer was added. */
++public record DailyActivity(long totalAmount, int transferCount) {
++}
+diff --git a/risk-service/src/main/java/dev/rendy/kirim/risk/rules/RiskProperties.java b/risk-service/src/main/java/dev/rendy/kirim/risk/rules/RiskProperties.java
+new file mode 100644
+index 0000000..a6eea52
+--- /dev/null
++++ b/risk-service/src/main/java/dev/rendy/kirim/risk/rules/RiskProperties.java
+@@ -0,0 +1,17 @@
++package dev.rendy.kirim.risk.rules;
++
++import org.springframework.boot.context.properties.ConfigurationProperties;
++import org.springframework.boot.context.properties.bind.DefaultValue;
++
++@ConfigurationProperties("risk")
++public record RiskProperties(
++        @DefaultValue("transfer-events") String topic,
++        @DefaultValue("Asia/Jakarta") String zone,
++        @DefaultValue("25000000") long largeTransferAmount,
++        @DefaultValue("100000000") long dailyTotalAmount,
++        @DefaultValue("20") int dailyTransferCount) {
++
++    public String deadLetterTopic() {
++        return topic + "-risk-dlt";
++    }
++}
+diff --git a/risk-service/src/main/java/dev/rendy/kirim/risk/rules/RiskRules.java b/risk-service/src/main/java/dev/rendy/kirim/risk/rules/RiskRules.java
+new file mode 100644
+index 0000000..e5600ac
+--- /dev/null
++++ b/risk-service/src/main/java/dev/rendy/kirim/risk/rules/RiskRules.java
+@@ -0,0 +1,60 @@
++package dev.rendy.kirim.risk.rules;
++
++import java.time.Instant;
++import java.time.LocalDate;
++import java.time.ZoneId;
++import java.util.ArrayList;
++import java.util.List;
++
++/**
++ * Pure rule evaluation: no database, no Kafka, no clock, so every rule is
++ * covered by fast unit tests.
++ *
++ * Daily rules fire once, on the transfer that crosses the threshold, not on
++ * every transfer after it. Otherwise one busy account would flood the
++ * analysts' queue with copies of the same alert.
++ */
++public final class RiskRules {
++
++    private RiskRules() {
++    }
++
++    public record Finding(AlertRule rule, String details) {
++    }
++
++    /**
++     * @param amount the current transfer
++     * @param after  the account's daily activity including the current transfer
++     */
++    public static List<Finding> evaluate(long amount, DailyActivity after, RiskProperties thresholds) {
++        List<Finding> findings = new ArrayList<>();
++
++        if (amount >= thresholds.largeTransferAmount()) {
++            findings.add(new Finding(AlertRule.LARGE_TRANSFER,
++                    "Single transfer of " + amount + " (threshold " + thresholds.largeTransferAmount() + ")"));
++        }
++
++        long totalBefore = after.totalAmount() - amount;
++        if (crosses(totalBefore, after.totalAmount(), thresholds.dailyTotalAmount())) {
++            findings.add(new Finding(AlertRule.DAILY_TOTAL_EXCEEDED,
++                    "Sent " + after.totalAmount() + " today (threshold " + thresholds.dailyTotalAmount() + ")"));
++        }
++
++        int countBefore = after.transferCount() - 1;
++        if (crosses(countBefore, after.transferCount(), thresholds.dailyTransferCount())) {
++            findings.add(new Finding(AlertRule.HIGH_DAILY_COUNT,
++                    after.transferCount() + " transfers today (threshold " + thresholds.dailyTransferCount() + ")"));
++        }
++
++        return findings;
++    }
++
++    /** The business day a transfer belongs to, e.g. 18:00 UTC is already the next day in Jakarta. */
++    public static LocalDate businessDay(Instant occurredAt, ZoneId zone) {
++        return LocalDate.ofInstant(occurredAt, zone);
++    }
++
++    private static boolean crosses(long before, long after, long threshold) {
++        return before < threshold && after >= threshold;
++    }
++}
+diff --git a/risk-service/src/main/java/dev/rendy/kirim/risk/store/Alert.java b/risk-service/src/main/java/dev/rendy/kirim/risk/store/Alert.java
+new file mode 100644
+index 0000000..c870085
+--- /dev/null
++++ b/risk-service/src/main/java/dev/rendy/kirim/risk/store/Alert.java
+@@ -0,0 +1,16 @@
++package dev.rendy.kirim.risk.store;
++
++import dev.rendy.kirim.risk.rules.AlertRule;
++import java.time.Instant;
++import java.util.UUID;
++
++public record Alert(
++        UUID id,
++        UUID eventId,
++        UUID transferId,
++        UUID accountId,
++        AlertRule rule,
++        long amount,
++        String details,
++        Instant createdAt) {
++}
+diff --git a/risk-service/src/main/java/dev/rendy/kirim/risk/store/RiskRepository.java b/risk-service/src/main/java/dev/rendy/kirim/risk/store/RiskRepository.java
+new file mode 100644
+index 0000000..d14977d
+--- /dev/null
++++ b/risk-service/src/main/java/dev/rendy/kirim/risk/store/RiskRepository.java
+@@ -0,0 +1,105 @@
++package dev.rendy.kirim.risk.store;
++
++import dev.rendy.kirim.risk.rules.AlertRule;
++import dev.rendy.kirim.risk.rules.DailyActivity;
++import java.sql.ResultSet;
++import java.sql.SQLException;
++import java.sql.Timestamp;
++import java.time.Instant;
++import java.time.LocalDate;
++import java.util.List;
++import java.util.Optional;
++import java.util.UUID;
++import org.springframework.jdbc.core.simple.JdbcClient;
++import org.springframework.stereotype.Repository;
++
++@Repository
++public class RiskRepository {
++
++    private final JdbcClient jdbc;
++
++    public RiskRepository(JdbcClient jdbc) {
++        this.jdbc = jdbc;
++    }
++
++    /** Returns false if this event was already processed (duplicate delivery). */
++    public boolean markProcessed(UUID eventId, Instant now) {
++        return jdbc.sql("""
++                        INSERT INTO processed_events (event_id, processed_at) VALUES (:eventId, :now)
++                        ON CONFLICT (event_id) DO NOTHING
++                        """)
++                .param("eventId", eventId)
++                .param("now", Timestamp.from(now))
++                .update() == 1;
++    }
++
++    /**
++     * Adds one transfer to the account's daily totals and returns the new totals.
++     * A single atomic upsert: concurrent consumers queue on the row lock instead
++     * of reading, adding and writing back (which would lose updates).
++     */
++    public DailyActivity addOutgoing(UUID accountId, LocalDate day, long amount) {
++        return jdbc.sql("""
++                        INSERT INTO daily_outgoing (account_id, day, total_amount, transfer_count)
++                        VALUES (:accountId, :day, :amount, 1)
++                        ON CONFLICT (account_id, day) DO UPDATE
++                           SET total_amount   = daily_outgoing.total_amount + EXCLUDED.total_amount,
++                               transfer_count = daily_outgoing.transfer_count + 1
++                        RETURNING total_amount, transfer_count
++                        """)
++                .param("accountId", accountId)
++                .param("day", day)
++                .param("amount", amount)
++                .query((rs, n) -> new DailyActivity(rs.getLong("total_amount"), rs.getInt("transfer_count")))
++                .single();
++    }
++
++    public Optional<DailyActivity> findDaily(UUID accountId, LocalDate day) {
++        return jdbc.sql("SELECT total_amount, transfer_count FROM daily_outgoing WHERE account_id = :accountId AND day = :day")
++                .param("accountId", accountId)
++                .param("day", day)
++                .query((rs, n) -> new DailyActivity(rs.getLong("total_amount"), rs.getInt("transfer_count")))
++                .optional();
++    }
++
++    public void insertAlert(Alert alert) {
++        jdbc.sql("""
++                        INSERT INTO alerts (id, event_id, transfer_id, account_id, rule, amount, details, created_at)
++                        VALUES (:id, :eventId, :transferId, :accountId, :rule, :amount, :details, :createdAt)
++                        """)
++                .param("id", alert.id())
++                .param("eventId", alert.eventId())
++                .param("transferId", alert.transferId())
++                .param("accountId", alert.accountId())
++                .param("rule", alert.rule().name())
++                .param("amount", alert.amount())
++                .param("details", alert.details())
++                .param("createdAt", Timestamp.from(alert.createdAt()))
++                .update();
++    }
++
++    public List<Alert> findAlertsByAccount(UUID accountId) {
++        return jdbc.sql("SELECT * FROM alerts WHERE account_id = :accountId ORDER BY created_at DESC LIMIT 100")
++                .param("accountId", accountId)
++                .query(RiskRepository::mapAlert)
++                .list();
++    }
++
++    public List<Alert> findRecentAlerts() {
++        return jdbc.sql("SELECT * FROM alerts ORDER BY created_at DESC LIMIT 100")
++                .query(RiskRepository::mapAlert)
++                .list();
++    }
++
++    private static Alert mapAlert(ResultSet rs, int rowNum) throws SQLException {
++        return new Alert(
++                rs.getObject("id", UUID.class),
++                rs.getObject("event_id", UUID.class),
++                rs.getObject("transfer_id", UUID.class),
++                rs.getObject("account_id", UUID.class),
++                AlertRule.valueOf(rs.getString("rule")),
++                rs.getLong("amount"),
++                rs.getString("details"),
++                rs.getTimestamp("created_at").toInstant());
++    }
++}
+diff --git a/risk-service/src/main/resources/application.yml b/risk-service/src/main/resources/application.yml
+new file mode 100644
+index 0000000..3cb65d8
+--- /dev/null
++++ b/risk-service/src/main/resources/application.yml
+@@ -0,0 +1,46 @@
++server:
++  port: 8081
++
++spring:
++  application:
++    name: kirim-risk-service
++  datasource:
++    # Database per service: the risk service never reads the transfer service's
++    # tables. It only learns about transfers from Kafka events.
++    url: jdbc:postgresql://localhost:5433/kirim_risk
++    username: kirim
++    password: kirim
++  kafka:
++    bootstrap-servers: localhost:9092
++    consumer:
++      group-id: kirim-risk
++      auto-offset-reset: earliest
++      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
++      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
++    producer:
++      # Used only to publish failed messages to the dead-letter topic.
++      key-serializer: org.apache.kafka.common.serialization.StringSerializer
++      value-serializer: org.apache.kafka.common.serialization.StringSerializer
++      acks: all
++
++management:
++  endpoints:
++    web:
++      exposure:
++        include: health,info,metrics,prometheus
++  endpoint:
++    health:
++      probes:
++        enabled: true
++
++springdoc:
++  swagger-ui:
++    path: /swagger-ui.html
++
++risk:
++  topic: transfer-events
++  # Transfers are bucketed into days in this zone (Indonesian business day).
++  zone: Asia/Jakarta
++  large-transfer-amount: 25000000  # Rp 25 juta in a single transfer
++  daily-total-amount: 100000000    # Rp 100 juta sent by one account in one day
++  daily-transfer-count: 20         # 20 transfers sent by one account in one day
+diff --git a/risk-service/src/main/resources/db/migration/V1__risk.sql b/risk-service/src/main/resources/db/migration/V1__risk.sql
+new file mode 100644
+index 0000000..aa6426b
+--- /dev/null
++++ b/risk-service/src/main/resources/db/migration/V1__risk.sql
+@@ -0,0 +1,31 @@
++-- The risk service's own database. It is built only from Kafka events.
++
++-- Consumer-side dedupe: at-least-once delivery becomes effectively-once.
++CREATE TABLE processed_events (
++    event_id      UUID PRIMARY KEY,
++    processed_at  TIMESTAMPTZ NOT NULL
++);
++
++-- Running totals per sending account per business day. Updated with an atomic
++-- upsert, so two consumers can never lose an increment.
++CREATE TABLE daily_outgoing (
++    account_id      UUID    NOT NULL,
++    day             DATE    NOT NULL,
++    total_amount    BIGINT  NOT NULL CHECK (total_amount >= 0),
++    transfer_count  INT     NOT NULL CHECK (transfer_count >= 0),
++    PRIMARY KEY (account_id, day)
++);
++
++CREATE TABLE alerts (
++    id           UUID PRIMARY KEY,
++    event_id     UUID         NOT NULL REFERENCES processed_events (event_id),
++    transfer_id  UUID         NOT NULL,
++    account_id   UUID         NOT NULL,
++    rule         VARCHAR(40)  NOT NULL,
++    amount       BIGINT       NOT NULL,
++    details      VARCHAR(200) NOT NULL,
++    created_at   TIMESTAMPTZ  NOT NULL,
++    UNIQUE (transfer_id, rule)
++);
++CREATE INDEX idx_alerts_account ON alerts (account_id, created_at DESC);
++CREATE INDEX idx_alerts_created ON alerts (created_at DESC);
+diff --git a/risk-service/src/test/java/dev/rendy/kirim/risk/RiskEventFlowIntegrationTest.java b/risk-service/src/test/java/dev/rendy/kirim/risk/RiskEventFlowIntegrationTest.java
+new file mode 100644
+index 0000000..738d397
+--- /dev/null
++++ b/risk-service/src/test/java/dev/rendy/kirim/risk/RiskEventFlowIntegrationTest.java
+@@ -0,0 +1,153 @@
++package dev.rendy.kirim.risk;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.awaitility.Awaitility.await;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
++
++import com.fasterxml.jackson.databind.ObjectMapper;
++import dev.rendy.kirim.risk.event.TransferEvent;
++import dev.rendy.kirim.risk.rules.AlertRule;
++import dev.rendy.kirim.risk.rules.DailyActivity;
++import dev.rendy.kirim.risk.rules.RiskProperties;
++import dev.rendy.kirim.risk.store.Alert;
++import dev.rendy.kirim.risk.store.RiskRepository;
++import dev.rendy.kirim.risk.support.IntegrationTest;
++import java.time.Duration;
++import java.time.Instant;
++import java.time.LocalDate;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.UUID;
++import java.util.concurrent.TimeUnit;
++import org.apache.kafka.clients.consumer.Consumer;
++import org.apache.kafka.clients.consumer.ConsumerRecord;
++import org.junit.jupiter.api.Test;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.kafka.core.ConsumerFactory;
++import org.springframework.kafka.core.KafkaTemplate;
++import org.springframework.test.web.servlet.MockMvc;
++
++/**
++ * Through a real Kafka broker: event on transfer-events -> listener -> rules -> PostgreSQL.
++ * Test thresholds (application-test.yml): large 2M, daily total 3M, daily count 5.
++ */
++class RiskEventFlowIntegrationTest extends IntegrationTest {
++
++    private static final Instant NOON_JAKARTA = Instant.parse("2026-03-10T05:00:00Z");
++    private static final LocalDate DAY = LocalDate.parse("2026-03-10");
++
++    @Autowired KafkaTemplate<String, String> kafka;
++    @Autowired ConsumerFactory<String, String> consumerFactory;
++    @Autowired ObjectMapper objectMapper;
++    @Autowired RiskRepository repository;
++    @Autowired RiskProperties props;
++    @Autowired MockMvc mockMvc;
++
++    private TransferEvent completed(UUID from, long amount, Instant at) {
++        return new TransferEvent(UUID.randomUUID(), "TRANSFER_COMPLETED", UUID.randomUUID(), from, UUID.randomUUID(),
++                amount, "IDR", "COMPLETED", null, at);
++    }
++
++    /** Keyed by sender, like the real producer, so one account's events stay in order on one partition. */
++    private void send(TransferEvent event) throws Exception {
++        sendRaw(event.fromAccountId().toString(), objectMapper.writeValueAsString(event));
++    }
++
++    private void sendRaw(String key, String value) throws Exception {
++        kafka.send(props.topic(), key, value).get(10, TimeUnit.SECONDS);
++    }
++
++    private DailyActivity awaitDailyCount(UUID account, LocalDate day, int count) {
++        await().atMost(Duration.ofSeconds(30)).until(() ->
++                repository.findDaily(account, day).map(DailyActivity::transferCount).orElse(0) == count);
++        return repository.findDaily(account, day).orElseThrow();
++    }
++
++    @Test
++    void aLargeTransferRaisesAnAlertAndIsAddedToTheDailyTotal() throws Exception {
++        UUID alice = UUID.randomUUID();
++        TransferEvent event = completed(alice, 2_500_000, NOON_JAKARTA);
++
++        send(event);
++
++        assertThat(awaitDailyCount(alice, DAY, 1)).isEqualTo(new DailyActivity(2_500_000, 1));
++        List<Alert> alerts = repository.findAlertsByAccount(alice);
++        assertThat(alerts).extracting(Alert::rule).containsExactly(AlertRule.LARGE_TRANSFER);
++        assertThat(alerts.get(0).transferId()).isEqualTo(event.transferId());
++    }
++
++    @Test
++    void aRedeliveredEventIsCountedOnce() throws Exception {
++        UUID alice = UUID.randomUUID();
++        TransferEvent event = completed(alice, 100_000, NOON_JAKARTA);
++
++        send(event);
++        send(event); // Kafka is at-least-once: the same event can arrive twice
++        send(completed(alice, 50_000, NOON_JAKARTA));
++
++        // Same key, same partition, so once the third event is in, the duplicate has been seen.
++        assertThat(awaitDailyCount(alice, DAY, 2)).isEqualTo(new DailyActivity(150_000, 2));
++    }
++
++    @Test
++    void theDailyTotalAlertIsRaisedOnceWhenTheThresholdIsCrossed() throws Exception {
++        UUID alice = UUID.randomUUID();
++        for (int i = 0; i < 4; i++) {
++            send(completed(alice, 1_000_000, NOON_JAKARTA)); // 1M, 2M, 3M (crosses 3M), 4M
++        }
++
++        awaitDailyCount(alice, DAY, 4);
++        assertThat(repository.findAlertsByAccount(alice)).extracting(Alert::rule)
++                .containsExactly(AlertRule.DAILY_TOTAL_EXCEEDED);
++    }
++
++    @Test
++    void rejectedTransfersAreIgnored() throws Exception {
++        UUID alice = UUID.randomUUID();
++        send(new TransferEvent(UUID.randomUUID(), "TRANSFER_REJECTED", UUID.randomUUID(), alice, UUID.randomUUID(),
++                9_000_000, "IDR", "REJECTED", "INSUFFICIENT_FUNDS", NOON_JAKARTA));
++        send(completed(alice, 10_000, NOON_JAKARTA));
++
++        assertThat(awaitDailyCount(alice, DAY, 1)).isEqualTo(new DailyActivity(10_000, 1));
++        assertThat(repository.findAlertsByAccount(alice)).isEmpty();
++    }
++
++    @Test
++    void transfersAreBucketedByJakartaBusinessDayAndExposedOverHttp() throws Exception {
++        UUID alice = UUID.randomUUID();
++        // 18:00 UTC on 1 Jan is 01:00 on 2 Jan in Jakarta.
++        send(completed(alice, 75_000, Instant.parse("2026-01-01T18:00:00Z")));
++
++        awaitDailyCount(alice, LocalDate.parse("2026-01-02"), 1);
++        mockMvc.perform(get("/api/v1/accounts/{id}/daily-activity", alice).param("day", "2026-01-02"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.totalAmount").value(75_000))
++                .andExpect(jsonPath("$.transferCount").value(1));
++        mockMvc.perform(get("/api/v1/accounts/{id}/daily-activity", alice).param("day", "2026-01-01"))
++                .andExpect(jsonPath("$.transferCount").value(0));
++    }
++
++    @Test
++    void aMalformedMessageGoesToTheDeadLetterTopicWithoutBlockingThePartition() throws Exception {
++        UUID alice = UUID.randomUUID();
++        String poison = "{not valid json " + UUID.randomUUID();
++
++        sendRaw(alice.toString(), poison);
++        send(completed(alice, 20_000, NOON_JAKARTA)); // same partition, right behind the bad message
++
++        awaitDailyCount(alice, DAY, 1);
++        try (Consumer<String, String> dlt = consumerFactory.createConsumer("dlt-reader-" + UUID.randomUUID(), null)) {
++            dlt.subscribe(List.of(props.deadLetterTopic()));
++            List<String> seen = new ArrayList<>();
++            // KafkaConsumer is single-threaded: poll it on this thread, not on Awaitility's.
++            await().pollInSameThread().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
++                for (ConsumerRecord<String, String> record : dlt.poll(Duration.ofMillis(500))) {
++                    seen.add(record.value());
++                }
++                assertThat(seen).contains(poison);
++            });
++        }
++    }
++}
+diff --git a/risk-service/src/test/java/dev/rendy/kirim/risk/rules/RiskRulesTest.java b/risk-service/src/test/java/dev/rendy/kirim/risk/rules/RiskRulesTest.java
+new file mode 100644
+index 0000000..b5d9cf5
+--- /dev/null
++++ b/risk-service/src/test/java/dev/rendy/kirim/risk/rules/RiskRulesTest.java
+@@ -0,0 +1,66 @@
++package dev.rendy.kirim.risk.rules;
++
++import static org.assertj.core.api.Assertions.assertThat;
++
++import java.time.Instant;
++import java.time.LocalDate;
++import java.time.ZoneId;
++import java.util.List;
++import org.junit.jupiter.api.Test;
++
++class RiskRulesTest {
++
++    private final RiskProperties thresholds =
++            new RiskProperties("transfer-events", "Asia/Jakarta", 25_000_000, 100_000_000, 20);
++
++    private List<AlertRule> rules(long amount, long totalAfter, int countAfter) {
++        return RiskRules.evaluate(amount, new DailyActivity(totalAfter, countAfter), thresholds)
++                .stream().map(RiskRules.Finding::rule).toList();
++    }
++
++    @Test
++    void anOrdinaryTransferRaisesNothing() {
++        assertThat(rules(150_000, 150_000, 1)).isEmpty();
++    }
++
++    @Test
++    void aTransferExactlyAtTheLargeThresholdIsFlagged() {
++        assertThat(rules(25_000_000, 25_000_000, 1)).containsExactly(AlertRule.LARGE_TRANSFER);
++        assertThat(rules(24_999_999, 24_999_999, 1)).isEmpty();
++    }
++
++    @Test
++    void theDailyTotalAlertFiresOnTheTransferThatCrossesIt() {
++        // 90M before, +10M -> exactly 100M: crosses.
++        assertThat(rules(10_000_000, 100_000_000, 5)).containsExactly(AlertRule.DAILY_TOTAL_EXCEEDED);
++    }
++
++    @Test
++    void theDailyTotalAlertDoesNotRepeatOnceTheAccountIsAlreadyOver() {
++        // 100M before, +1M -> 101M: was already over, no new alert.
++        assertThat(rules(1_000_000, 101_000_000, 6)).isEmpty();
++    }
++
++    @Test
++    void theDailyCountAlertFiresOnceOnTheTwentiethTransfer() {
++        assertThat(rules(10_000, 190_000, 19)).isEmpty();
++        assertThat(rules(10_000, 200_000, 20)).containsExactly(AlertRule.HIGH_DAILY_COUNT);
++        assertThat(rules(10_000, 210_000, 21)).isEmpty();
++    }
++
++    @Test
++    void oneTransferCanBreakSeveralRules() {
++        // First transfer of the day is 100M: large, and it alone reaches the daily total.
++        assertThat(rules(100_000_000, 100_000_000, 1))
++                .containsExactly(AlertRule.LARGE_TRANSFER, AlertRule.DAILY_TOTAL_EXCEEDED);
++    }
++
++    @Test
++    void daysAreCountedInJakartaTimeNotUtc() {
++        ZoneId jakarta = ZoneId.of("Asia/Jakarta"); // UTC+7
++        assertThat(RiskRules.businessDay(Instant.parse("2026-01-01T16:59:59Z"), jakarta))
++                .isEqualTo(LocalDate.parse("2026-01-01"));
++        assertThat(RiskRules.businessDay(Instant.parse("2026-01-01T17:00:00Z"), jakarta))
++                .isEqualTo(LocalDate.parse("2026-01-02"));
++    }
++}
+diff --git a/risk-service/src/test/java/dev/rendy/kirim/risk/support/IntegrationTest.java b/risk-service/src/test/java/dev/rendy/kirim/risk/support/IntegrationTest.java
+new file mode 100644
+index 0000000..f3f8026
+--- /dev/null
++++ b/risk-service/src/test/java/dev/rendy/kirim/risk/support/IntegrationTest.java
+@@ -0,0 +1,28 @@
++package dev.rendy.kirim.risk.support;
++
++import org.junit.jupiter.api.BeforeEach;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
++import org.springframework.boot.test.context.SpringBootTest;
++import org.springframework.context.annotation.Import;
++import org.springframework.jdbc.core.simple.JdbcClient;
++import org.springframework.test.context.ActiveProfiles;
++
++/**
++ * Base class for integration tests: real PostgreSQL and Kafka (Testcontainers),
++ * one shared Spring context, clean tables before every test.
++ */
++@SpringBootTest
++@AutoConfigureMockMvc
++@ActiveProfiles("test")
++@Import(TestcontainersConfiguration.class)
++public abstract class IntegrationTest {
++
++    @Autowired
++    protected JdbcClient jdbc;
++
++    @BeforeEach
++    void cleanDatabase() {
++        jdbc.sql("TRUNCATE alerts, daily_outgoing, processed_events CASCADE").update();
++    }
++}
+diff --git a/risk-service/src/test/java/dev/rendy/kirim/risk/support/TestcontainersConfiguration.java b/risk-service/src/test/java/dev/rendy/kirim/risk/support/TestcontainersConfiguration.java
+new file mode 100644
+index 0000000..8903e2d
+--- /dev/null
++++ b/risk-service/src/test/java/dev/rendy/kirim/risk/support/TestcontainersConfiguration.java
+@@ -0,0 +1,25 @@
++package dev.rendy.kirim.risk.support;
++
++import org.springframework.boot.test.context.TestConfiguration;
++import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
++import org.springframework.context.annotation.Bean;
++import org.testcontainers.containers.PostgreSQLContainer;
++import org.testcontainers.kafka.ConfluentKafkaContainer;
++import org.testcontainers.utility.DockerImageName;
++
++/** @ServiceConnection wires the containers' URLs into Spring. Needs Docker running. */
++@TestConfiguration(proxyBeanMethods = false)
++public class TestcontainersConfiguration {
++
++    @Bean
++    @ServiceConnection
++    PostgreSQLContainer<?> postgres() {
++        return new PostgreSQLContainer<>(DockerImageName.parse("postgres:16-alpine"));
++    }
++
++    @Bean
++    @ServiceConnection
++    ConfluentKafkaContainer kafka() {
++        return new ConfluentKafkaContainer(DockerImageName.parse("confluentinc/cp-kafka:7.8.0"));
++    }
++}
+diff --git a/risk-service/src/test/resources/application-test.yml b/risk-service/src/test/resources/application-test.yml
+new file mode 100644
+index 0000000..7c70d4d
+--- /dev/null
++++ b/risk-service/src/test/resources/application-test.yml
+@@ -0,0 +1,5 @@
++# Small thresholds so tests can cross them with a few events.
++risk:
++  large-transfer-amount: 2000000
++  daily-total-amount: 3000000
++  daily-transfer-count: 5

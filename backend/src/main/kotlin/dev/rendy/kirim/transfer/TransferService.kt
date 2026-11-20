@@ -14,6 +14,7 @@ import dev.rendy.kirim.outbox.OutboxEvent
 import dev.rendy.kirim.outbox.OutboxRepository
 import dev.rendy.kirim.outbox.TransferEvent
 import dev.rendy.kirim.outbox.TransferEventType
+import dev.rendy.kirim.ratelimit.TransferRateLimiter
 import io.micrometer.core.instrument.MeterRegistry
 import org.springframework.boot.context.properties.ConfigurationProperties
 import org.springframework.stereotype.Service
@@ -36,6 +37,8 @@ class TransferService(
     private val clock: Clock,
     private val props: TransferProperties,
     private val meters: MeterRegistry,
+    private val rateLimiter: TransferRateLimiter,
+    private val cache: TransferCache,
 ) {
 
     /**
@@ -56,14 +59,23 @@ class TransferService(
             return replay(idempotencyKey, fingerprint)
         }
 
+        // Checked after the key is reserved, so replays of an earlier request never
+        // use up quota. If the limit is hit, the exception rolls back the key and the
+        // client can retry later with the same key.
+        rateLimiter.acquire(command.fromAccountId)
+
         val transfer = execute(command, now)
         idempotency.attachTransfer(idempotencyKey, transfer.id)
         meters.counter("kirim.transfers", "status", transfer.status.name).increment()
         return TransferResult(transfer, replayed = false)
     }
 
+    /** Cache-aside: Redis first, then PostgreSQL (and fill the cache). Safe because transfers never change. */
     @Transactional(readOnly = true)
-    fun get(id: UUID): Transfer = transfers.findById(id) ?: throw TransferNotFoundException(id)
+    fun get(id: UUID): Transfer =
+        cache.get(id)
+            ?: transfers.findById(id)?.also { cache.put(it) }
+            ?: throw TransferNotFoundException(id)
 
     private fun replay(key: String, fingerprint: String): TransferResult {
         val record = idempotency.find(key) ?: throw IdempotentRequestInProgressException(key)

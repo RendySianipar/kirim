@@ -1,0 +1,26 @@
+# For a local kind cluster. Build the images, load them into kind, apply:
+#   docker build -t kirim-api:dev ./backend
+#   docker build -t kirim-risk-service:dev ./risk-service
+#   kind load docker-image kirim-api:dev kirim-risk-service:dev
+#   kubectl apply -k deploy/k8s/overlays/local
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+
+images:
+  - name: kirim-api
+    newTag: dev
+  - name: kirim-risk-service
+    newTag: dev
+
+# One API pod is enough on a laptop.
+patches:
+  - target:
+      kind: Deployment
+      name: kirim-api
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 1

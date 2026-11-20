@@ -2,6 +2,8 @@
 backend/.gradle/
 backend/build/
 backend/.kotlin/
+risk-service/.gradle/
+risk-service/build/
 # IDE
 .idea/
 *.iml

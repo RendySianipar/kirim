@@ -5,5 +5,8 @@ spring:
       maximum-pool-size: 20
 
 kirim:
+  rate-limit:
+    # High enough for the concurrency tests; RateLimitIntegrationTest lowers it.
+    transfers-per-window: 100000
   outbox:
     scheduler-enabled: false
