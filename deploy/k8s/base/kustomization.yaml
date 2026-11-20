@@ -1,0 +1,40 @@
+# Kirim on Kubernetes: transfer API (Kotlin), risk service (Java), PostgreSQL,
+# Kafka and Redis. Apply an overlay, not this base directly:
+#   kubectl apply -k deploy/k8s/overlays/local
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: kirim
+
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: kirim
+
+resources:
+  - namespace.yaml
+  - postgres.yaml
+  - kafka.yaml
+  - redis.yaml
+  - kirim-api.yaml
+  - risk-service.yaml
+
+# Development credentials only. In a real cluster these come from a secret
+# manager (External Secrets, Sealed Secrets, Vault), never from Git.
+secretGenerator:
+  - name: kirim-db
+    literals:
+      - username=kirim
+      - password=kirim-dev-password
+
+configMapGenerator:
+  - name: kirim-api-config
+    literals:
+      - SPRING_DATASOURCE_URL=jdbc:postgresql://postgres:5432/kirim
+      - SPRING_KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - SPRING_DATA_REDIS_HOST=redis
+      - SERVER_SHUTDOWN=graceful
+  - name: risk-service-config
+    literals:
+      - SPRING_DATASOURCE_URL=jdbc:postgresql://postgres:5432/kirim_risk
+      - SPRING_KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - SERVER_SHUTDOWN=graceful

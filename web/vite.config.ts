@@ -6,7 +6,7 @@ export default defineConfig({
   server: {
     // Same-origin calls in dev: /api/* goes to the Spring Boot app.
     proxy: {
-      '/api': 'http://localhost:8080',
+      '/api': 'http://localhost:8081',
     },
   },
 })

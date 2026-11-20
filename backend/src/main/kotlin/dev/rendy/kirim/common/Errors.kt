@@ -1,7 +1,10 @@
 package dev.rendy.kirim.common
 
+import dev.rendy.kirim.ratelimit.RateLimitExceededException
+import org.springframework.http.HttpHeaders
 import org.springframework.http.HttpStatus
 import org.springframework.http.ProblemDetail
+import org.springframework.http.ResponseEntity
 import org.springframework.web.bind.annotation.ExceptionHandler
 import org.springframework.web.bind.annotation.RestControllerAdvice
 import org.springframework.web.servlet.mvc.method.annotation.ResponseEntityExceptionHandler
@@ -51,6 +54,13 @@ class GlobalExceptionHandler : ResponseEntityExceptionHandler() {
             title = ex.status.reasonPhrase
             setProperty("code", ex.code)
         }
+
+    /** 429 also tells the client when to come back (Retry-After, in seconds). */
+    @ExceptionHandler(RateLimitExceededException::class)
+    fun handleRateLimited(ex: RateLimitExceededException): ResponseEntity<ProblemDetail> =
+        ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
+            .header(HttpHeaders.RETRY_AFTER, ex.retryAfterSeconds.toString())
+            .body(handleApiException(ex))
 
     @ExceptionHandler(IllegalArgumentException::class)
     fun handleIllegalArgument(ex: IllegalArgumentException): ProblemDetail =

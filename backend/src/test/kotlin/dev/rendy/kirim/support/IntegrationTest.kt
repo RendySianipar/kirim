@@ -8,8 +8,11 @@ import org.springframework.boot.test.context.TestConfiguration
 import org.springframework.boot.testcontainers.service.connection.ServiceConnection
 import org.springframework.context.annotation.Bean
 import org.springframework.context.annotation.Import
+import org.springframework.data.redis.core.RedisCallback
+import org.springframework.data.redis.core.StringRedisTemplate
 import org.springframework.jdbc.core.simple.JdbcClient
 import org.springframework.test.context.ActiveProfiles
+import org.testcontainers.containers.GenericContainer
 import org.testcontainers.containers.PostgreSQLContainer
 import org.testcontainers.kafka.ConfluentKafkaContainer
 import org.testcontainers.utility.DockerImageName
@@ -19,8 +22,11 @@ import java.time.Instant
 import java.time.ZoneId
 import java.time.ZoneOffset
 
+/** Typed subclass so withExposedPorts() returns a usable type in Kotlin (GenericContainer<SELF>). */
+class RedisContainer(image: DockerImageName) : GenericContainer<RedisContainer>(image)
+
 /**
- * Real PostgreSQL and Kafka in Docker via Testcontainers; @ServiceConnection
+ * Real PostgreSQL, Kafka and Redis in Docker via Testcontainers; @ServiceConnection
  * wires their URLs into Spring automatically. Needs Docker running.
  */
 @TestConfiguration(proxyBeanMethods = false)
@@ -33,6 +39,10 @@ class TestcontainersConfiguration {
     @Bean
     @ServiceConnection
     fun kafka(): ConfluentKafkaContainer = ConfluentKafkaContainer(DockerImageName.parse("confluentinc/cp-kafka:7.8.0"))
+
+    @Bean
+    @ServiceConnection(name = "redis")
+    fun redis(): RedisContainer = RedisContainer(DockerImageName.parse("redis:7-alpine")).withExposedPorts(6379)
 }
 
 /**
@@ -50,11 +60,19 @@ abstract class IntegrationTest {
     @Autowired
     lateinit var jdbc: JdbcClient
 
+    @Autowired
+    lateinit var redis: StringRedisTemplate
+
     @BeforeEach
     fun cleanDatabase() {
         jdbc.sql(
             "TRUNCATE notifications, processed_events, outbox_events, idempotency_keys, ledger_entries, transfers, accounts CASCADE",
         ).update()
+        // Rate-limit counters and cached transfers must not leak between tests.
+        redis.execute(RedisCallback<Any?> { connection ->
+            connection.serverCommands().flushDb()
+            null
+        })
     }
 }
 
