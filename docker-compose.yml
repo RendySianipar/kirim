@@ -45,7 +45,7 @@ services:
     image: redis:7-alpine
     command: ["redis-server", "--save", "", "--appendonly", "no"]
     ports:
-      - "6379:6379"
+      - "${REDIS_PORT:-6379}:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -54,7 +54,7 @@ services:
   api:
     build: ./backend
     ports:
-      - "8080:8080"
+      - "${API_PORT:-8080}:8080"
     environment:
       SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/kirim
       SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:19092
