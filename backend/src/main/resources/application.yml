@@ -53,6 +53,11 @@ springdoc:
     path: /swagger-ui.html
 
 kirim:
+  reconciliation:
+    scheduler-enabled: true
+    cron: "0 30 1 * * *"   # 01:30 every night...
+    zone: Asia/Jakarta     # ...WIB: reconcile the business day that just ended
+    pending-grace: 5m      # a PENDING outbox event younger than this is still in flight
   rate-limit:
     enabled: true
     transfers-per-window: 10 # new transfers per source account...

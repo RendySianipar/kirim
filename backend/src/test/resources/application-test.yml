@@ -10,3 +10,5 @@ kirim:
     transfers-per-window: 100000
   outbox:
     scheduler-enabled: false
+  reconciliation:
+    scheduler-enabled: false

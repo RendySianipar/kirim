@@ -66,7 +66,7 @@ abstract class IntegrationTest {
     @BeforeEach
     fun cleanDatabase() {
         jdbc.sql(
-            "TRUNCATE notifications, processed_events, outbox_events, idempotency_keys, ledger_entries, transfers, accounts CASCADE",
+            "TRUNCATE reconciliation_mismatches, reconciliation_runs, notifications, processed_events, outbox_events, idempotency_keys, ledger_entries, transfers, accounts CASCADE",
         ).update()
         // Rate-limit counters and cached transfers must not leak between tests.
         redis.execute(RedisCallback<Any?> { connection ->
