@@ -55,6 +55,7 @@ Then, asynchronously:
 7. The **outbox relay** claims due events (`FOR UPDATE SKIP LOCKED`, so it's safe with many instances), publishes to Kafka with `acks=all` and an idempotent producer, and marks them `PUBLISHED`. On failure it retries with **exponential backoff** (1s, 2s, 4s, … capped at 5m) and parks the event as `FAILED` after `max-attempts`.
 8. The **notification consumer** dedupes on `eventId` in the same transaction as its write, so **at-least-once delivery becomes effectively-once**. Failing messages are retried (0.5s → 4s) and then sent to the **dead-letter topic**. Malformed JSON skips the retries.
 9. The **risk service** reads the same topic in its own consumer group, adds the transfer to the sender's daily totals (Jakarta business day, one atomic upsert) and raises alerts: `LARGE_TRANSFER`, `DAILY_TOTAL_EXCEEDED`, `HIGH_DAILY_COUNT`.
+10. Every night at 01:30 WIB a **reconciliation** checks that the books add up for the day before: balances = ledger, no money created or lost, every transfer has its two ledger legs and one delivered event. It reads one `REPEATABLE READ` snapshot, stores every run and mismatch (`/api/v1/reconciliations`), and runs once even with several replicas ([ADR 0007](docs/adr/0007-daily-reconciliation.md)).
 
 `GET /api/v1/transfers/{id}` reads Redis first, then PostgreSQL (cache-aside). Transfers never change after commit, so the cache never needs invalidating.
 
@@ -68,6 +69,7 @@ Then, asynchronously:
 | Transactional outbox | Avoids the dual-write problem (DB commit OK but Kafka publish lost, or the reverse) | Publish inside the request; CDC with Debezium |
 | Plain SQL via `JdbcClient` | Locking and `ON CONFLICT` semantics are explicit and reviewable | JPA/Hibernate |
 | Redis for rate limits and cache only | Shared across replicas; never the source of truth, so a Redis outage degrades instead of breaking transfers | Idempotency in Redis (`SETNX`): can't be atomic with the PostgreSQL write |
+| Daily reconciliation that reports, never repairs | Catches damage outside the transfer code (manual SQL, bugs, stuck events); fixing money stays a human decision | Trusting the code alone; auto-correcting balances |
 | Separate risk service, Kafka-only input | Detection must not slow down or fail transfers; database per service | Checks inside the transfer transaction |
 
 More detail in [`docs/adr`](docs/adr).
@@ -173,6 +175,7 @@ cd web && npm test
 | `TransferEventFlowIntegrationTest` | Real Kafka end to end; duplicate delivery does not duplicate notifications |
 | `TransferRateLimiterIntegrationTest` | Real Redis, controlled clock: limit per window, window rollover, per-account isolation, TTL always set, fail-open / fail-closed / disabled |
 | `RateLimitApiIntegrationTest` | `429` + `Retry-After` problem details; replays use no quota; a limited request doesn't burn its idempotency key |
+| `ReconciliationIntegrationTest` | Correct books match; a hand-edited balance, a missing ledger leg, a rejected transfer with entries, failed/missing/stale events are each named; only the business day's transfers are checked; the nightly run happens once across replicas; HTTP API |
 | `TransferCacheIntegrationTest` | Nothing cached inside the write transaction; miss then hit; cached copy equals the DB row; 404s not cached |
 | `RiskRulesTest` (Java) | Each AML rule at its threshold; daily alerts fire once at the crossing; Jakarta day boundary |
 | `RiskEventFlowIntegrationTest` (Java) | Real Kafka: alerts and daily totals, duplicate delivery counted once, rejected transfers ignored, poison message → risk DLT without blocking the partition |
@@ -191,6 +194,7 @@ backend/src/main/kotlin/dev/rendy/kirim/
   outbox/        outbox table, relay + backoff, Kafka publisher
   notification/  Kafka consumer (idempotent), notifications API
   ratelimit/     Redis rate limiter (Lua fixed window)
+  reconciliation/ nightly reconciliation: SQL checks on one snapshot, runs + mismatches, API
   common/        Problem Details error handling, JDBC helpers
   config/        Kafka topics + error handler / DLT, OpenAPI, CORS, Clock
 backend/src/main/resources/db/migration/   Flyway SQL

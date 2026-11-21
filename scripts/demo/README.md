@@ -31,8 +31,9 @@ Dot-source every script (the leading `. `), so `$alice`, `$bob`, `Send-Transfer`
 | `06-cache-metrics.ps1` | Cache (Redis), metrics | Cache miss then hit for `GET /transfers/{id}`, the entry and its TTL in Redis, Prometheus counters |
 | `07-redis-down.ps1` | Fail open | **Stops Redis**: transfers still work, readiness stays `UP`, overall health `DOWN` |
 | `08-rejections.ps1` | Errors | `REJECTED` transfers (insufficient funds, over Rp 50 juta) vs. `400`/`404` validation errors |
+| `09-reconciliation.ps1` | Daily reconciliation | Books `MATCHED`; a balance changed by hand is caught as `BALANCE_MISMATCH` + `MONEY_NOT_CONSERVED`; repaired → `MATCHED`; run history and metrics |
 
-`03b` and `07` stop a container and start it again in a `finally` block, so it comes back even if the script fails halfway.
+`09` changes one balance on purpose and puts it back. `03b` and `07` stop a container and start it again in a `finally` block, so it comes back even if the script fails halfway.
 
 ## Ports
 

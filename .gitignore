@@ -15,3 +15,4 @@ web/dist/
 .DS_Store
 # Config
 .env
+# Patch files received for applying, not part of the project n*.patch
