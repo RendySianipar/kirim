@@ -1,8 +1,19 @@
 # Local stack.
-#   docker compose up -d postgres kafka redis   -> infra only, run the services from your IDE
-#   docker compose up --build                   -> everything: API on :8080, risk service on :8081
+#   docker compose up --build -d                -> everything, behind the reverse proxy on http://localhost
+#   docker compose up -d postgres kafka redis keycloak nginx
+#                                               -> infra + login + proxy; run the services from your IDE
+# Entry point: http://localhost (web app), /api (transfer API), /risk (risk service), /auth (Keycloak).
+# The API (:8080) and risk service (:8081) ports stay published for debugging only.
+# Ports and the public URL can be changed in .env: API_PORT, REDIS_PORT, PROXY_PORT, KIRIM_PUBLIC_URL.
 # If you created the postgres volume before the risk service existed, run
 # `docker compose down -v` once so the kirim_risk database gets created.
+
+# Tokens must name the same issuer that clients log in through (the proxy URL),
+# while services fetch signing keys from Keycloak directly inside the network.
+x-kirim-auth: &kirim-auth
+  SPRING_SECURITY_OAUTH2_RESOURCESERVER_JWT_ISSUER_URI: ${KIRIM_PUBLIC_URL:-http://localhost}/auth/realms/kirim
+  SPRING_SECURITY_OAUTH2_RESOURCESERVER_JWT_JWK_SET_URI: http://keycloak:8080/auth/realms/kirim/protocol/openid-connect/certs
+
 services:
   postgres:
     image: postgres:16-alpine
@@ -56,6 +67,7 @@ services:
     ports:
       - "${API_PORT:-8080}:8080"
     environment:
+      <<: *kirim-auth
       SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/kirim
       SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:19092
       SPRING_DATA_REDIS_HOST: redis
@@ -66,12 +78,15 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      keycloak:
+        condition: service_started
 
   risk-service:
     build: ./risk-service
     ports:
       - "8081:8081"
     environment:
+      <<: *kirim-auth
       SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/kirim_risk
       SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:19092
     depends_on:
@@ -79,3 +94,43 @@ services:
         condition: service_healthy
       kafka:
         condition: service_healthy
+      keycloak:
+        condition: service_started
+
+  # Login server (OAuth2 / OpenID Connect). Development mode: in-memory H2
+  # database, realm "kirim" with its users imported on every fresh start.
+  # Admin console: http://localhost/auth/admin (admin / admin).
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.4
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      KC_HTTP_RELATIVE_PATH: /auth
+      # Every token says it was issued by the public URL, whichever way Keycloak was reached.
+      KC_HOSTNAME: ${KIRIM_PUBLIC_URL:-http://localhost}/auth
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
+      KC_PROXY_HEADERS: xforwarded
+      KC_HTTP_ENABLED: "true"
+      KC_HEALTH_ENABLED: "true"
+    volumes:
+      - ./deploy/keycloak:/opt/keycloak/data/import:ro
+    healthcheck:
+      # The image has no curl: ask the management port with bash's /dev/tcp.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9000 && printf 'GET /auth/health/ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && grep -q UP <&3"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  # Reverse proxy and web app: the single public entry point.
+  nginx:
+    build:
+      context: .
+      dockerfile: deploy/nginx/Dockerfile
+    ports:
+      - "${PROXY_PORT:-80}:80"
+    depends_on:
+      - api
+      - risk-service
+      - keycloak

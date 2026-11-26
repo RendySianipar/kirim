@@ -15,6 +15,8 @@ It is built to show the building blocks of resilient back-end systems: **APIs, d
 | Front end | React 19 + TypeScript + Vite, retry-safe API client |
 | Quality | Unit tests written first, Testcontainers integration tests, concurrency tests, Vitest |
 | Delivery | Docker multi-stage builds, docker-compose, **Kubernetes** (Kustomize), **GitLab CI/CD** (test, build, deploy), GitHub Actions |
+| Security | Keycloak (OpenID Connect), Spring Security resource servers (JWT), account ownership checks, OPS role, PKCE login in the web app |
+| Edge | Nginx reverse proxy: one entry point, `X-Request-Id`, per-IP rate limits, actuator hidden |
 | Ops | Liveness/readiness/startup probes, Micrometer metrics, Prometheus endpoint, non-root read-only containers |
 
 ---
@@ -69,6 +71,8 @@ Then, asynchronously:
 | Transactional outbox | Avoids the dual-write problem (DB commit OK but Kafka publish lost, or the reverse) | Publish inside the request; CDC with Debezium |
 | Plain SQL via `JdbcClient` | Locking and `ON CONFLICT` semantics are explicit and reviewable | JPA/Hibernate |
 | Redis for rate limits and cache only | Shared across replicas; never the source of truth, so a Redis outage degrades instead of breaking transfers | Idempotency in Redis (`SETNX`): can't be atomic with the PostgreSQL write |
+| Keycloak + resource servers | Services never see passwords; roles and ownership are checked on every request ([ADR 0008](docs/adr/0008-authentication-with-keycloak.md)) | Login built into the transfer API |
+| One Nginx entry point | Same origin for web app, APIs and login; internal endpoints stay internal ([ADR 0009](docs/adr/0009-reverse-proxy.md)) | A port per service |
 | Daily reconciliation that reports, never repairs | Catches damage outside the transfer code (manual SQL, bugs, stuck events); fixing money stays a human decision | Trusting the code alone; auto-correcting balances |
 | Separate risk service, Kafka-only input | Detection must not slow down or fail transfers; database per service | Checks inside the transfer transaction |
 
@@ -106,6 +110,8 @@ Or run everything in Docker: `docker compose up --build`.
 - Risk service: http://localhost:8081/api/v1/alerts, `/api/v1/accounts/{id}/daily-activity`, Swagger at http://localhost:8081/swagger-ui.html
 
 Try every feature from PowerShell: see [scripts/demo](scripts/demo/README.md).
+
+With `docker compose up --build -d` everything is behind the reverse proxy: web app at http://localhost (log in as `alice` / `alice`, `bob` / `bob`, or `ops` / `ops`), API under http://localhost/api, Swagger at http://localhost/swagger-ui.html (click **Authorize** and paste a token, e.g. from `Get-KirimToken alice` in the demo scripts), Keycloak admin at http://localhost/auth/admin (`admin` / `admin`). For `npm run dev` on :5173, put `VITE_KEYCLOAK_URL=http://localhost/auth` in `web/.env.local`.
 
 ### Try the API
 
@@ -175,6 +181,7 @@ cd web && npm test
 | `TransferEventFlowIntegrationTest` | Real Kafka end to end; duplicate delivery does not duplicate notifications |
 | `TransferRateLimiterIntegrationTest` | Real Redis, controlled clock: limit per window, window rollover, per-account isolation, TTL always set, fail-open / fail-closed / disabled |
 | `RateLimitApiIntegrationTest` | `429` + `Retry-After` problem details; replays use no quota; a limited request doesn't burn its idempotency key |
+| `SecurityIntegrationTest` | 401 without a token; 403 without a role; accounts belong to the caller; customers see only their own accounts (others 404); sending only from your own account, OPS may look but not move money; transfer visibility; OPS-only reconciliation |
 | `ReconciliationIntegrationTest` | Correct books match; a hand-edited balance, a missing ledger leg, a rejected transfer with entries, failed/missing/stale events are each named; only the business day's transfers are checked; the nightly run happens once across replicas; HTTP API |
 | `TransferCacheIntegrationTest` | Nothing cached inside the write transaction; miss then hit; cached copy equals the DB row; 404s not cached |
 | `RiskRulesTest` (Java) | Each AML rule at its threshold; daily alerts fire once at the crossing; Jakarta day boundary |

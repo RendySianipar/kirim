@@ -23,6 +23,10 @@ class AccountNotFoundException(id: UUID) :
 class TransferNotFoundException(id: UUID) :
     ApiException(HttpStatus.NOT_FOUND, "TRANSFER_NOT_FOUND", "Transfer $id was not found")
 
+/** Moving money out of an account needs its owner; nobody else, OPS included (separation of duties). */
+class AccountNotOwnedException(id: UUID) :
+    ApiException(HttpStatus.FORBIDDEN, "ACCOUNT_NOT_OWNED", "You can only send money from your own accounts (account $id)")
+
 class InvalidRequestException(message: String) :
     ApiException(HttpStatus.BAD_REQUEST, "INVALID_REQUEST", message)
 

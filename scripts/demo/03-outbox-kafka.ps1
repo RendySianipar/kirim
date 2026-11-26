@@ -4,13 +4,13 @@
 Start-Sleep 2   # outbox relay polls every 500 ms; give the consumers a moment
 
 Step "Ledger entries (newest first)"
-Invoke-RestMethod "$api/accounts/$($alice.id)/entries?limit=5" | Format-Table type, amount, balanceAfter, createdAt -AutoSize
-Invoke-RestMethod "$api/accounts/$($bob.id)/entries?limit=5"   | Format-Table type, amount, balanceAfter, createdAt -AutoSize
+Invoke-Kirim "$api/accounts/$($alice.id)/entries?limit=5" -As alice | Format-Table type, amount, balanceAfter, createdAt -AutoSize
+Invoke-Kirim "$api/accounts/$($bob.id)/entries?limit=5" -As bob | Format-Table type, amount, balanceAfter, createdAt -AutoSize
 Expect "Alice has DEBIT 150000; Bob has CREDIT 150000"
 
 Step "Notifications written by the Kafka consumer"
-Invoke-RestMethod "$api/accounts/$($alice.id)/notifications" | Format-Table message, createdAt -AutoSize
-Invoke-RestMethod "$api/accounts/$($bob.id)/notifications"   | Format-Table message, createdAt -AutoSize
+Invoke-Kirim "$api/accounts/$($alice.id)/notifications" -As alice | Format-Table message, createdAt -AutoSize
+Invoke-Kirim "$api/accounts/$($bob.id)/notifications" -As bob | Format-Table message, createdAt -AutoSize
 Expect "'You sent IDR 150,000' for Alice, 'You received IDR 150,000' for Bob"
 
 Step "Outbox table (written in the same transaction as the transfer)"

@@ -2,6 +2,7 @@ package dev.rendy.kirim.transfer
 
 import dev.rendy.kirim.account.AccountService
 import dev.rendy.kirim.common.TransferNotFoundException
+import dev.rendy.kirim.support.Auth
 import dev.rendy.kirim.support.IntegrationTest
 import io.micrometer.core.instrument.MeterRegistry
 import org.junit.jupiter.api.Test
@@ -38,8 +39,8 @@ class TransferCacheIntegrationTest : IntegrationTest() {
         val misses = count("miss")
         val hits = count("hit")
 
-        mockMvc.get("/api/v1/transfers/${transfer.id}").andExpect { status { isOk() } }
-        mockMvc.get("/api/v1/transfers/${transfer.id}").andExpect {
+        mockMvc.get("/api/v1/transfers/${transfer.id}") { with(Auth.ops()) }.andExpect { status { isOk() } }
+        mockMvc.get("/api/v1/transfers/${transfer.id}") { with(Auth.ops()) }.andExpect {
             status { isOk() }
             jsonPath("$.description") { value("kopi") }
         }

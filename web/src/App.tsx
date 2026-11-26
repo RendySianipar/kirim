@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState, type FormEvent } from 'react'
 import { api, ApiError, formatIdr, type Account, type LedgerEntry, type Notification, type TransferOutcome } from './api/client'
+import { currentUser, logout } from './auth'
 
 interface LogLine {
   id: number
@@ -11,6 +12,7 @@ interface LogLine {
 let logId = 0
 
 export default function App() {
+  const user = currentUser()
   const [accounts, setAccounts] = useState<Account[]>([])
   const [selected, setSelected] = useState<string | null>(null)
   const [log, setLog] = useState<LogLine[]>([])
@@ -23,7 +25,7 @@ export default function App() {
       setLoadError(null)
       setSelected((current) => current ?? list[0]?.id ?? null)
     } catch {
-      setLoadError('Cannot reach the API. Is the backend running on :8080?')
+      setLoadError('Cannot reach the API. Is docker compose running?')
     }
   }, [])
 
@@ -38,25 +40,31 @@ export default function App() {
       <header>
         <h1>Kirim</h1>
         <p>Transfers with idempotency keys, a transactional outbox and Kafka events.</p>
+        <p className="muted small">
+          Signed in as <strong>{user.username}</strong>
+          {user.isOps && <span className="pill">ops</span>}{' '}
+          <button type="button" className="secondary" onClick={() => void logout()}>Log out</button>
+        </p>
       </header>
 
       {loadError && <div className="banner">{loadError}</div>}
 
       <main>
         <section className="card">
-          <h2>Accounts</h2>
+          <h2>{user.isOps ? 'All accounts' : 'My accounts'}</h2>
           <ul className="accounts">
             {accounts.map((a) => (
               <li key={a.id}>
                 <button className={a.id === selected ? 'account active' : 'account'} onClick={() => setSelected(a.id)}>
                   <span>{a.ownerName}</span>
                   <strong>{formatIdr(a.balance)}</strong>
+                  <code className="muted small" title="Share this account ID to receive money">{a.id}</code>
                 </button>
               </li>
             ))}
-            {accounts.length === 0 && !loadError && <li className="muted">No accounts yet. Open two to get started.</li>}
+            {accounts.length === 0 && !loadError && <li className="muted">No accounts yet. Open one to get started.</li>}
           </ul>
-          <OpenAccountForm onOpened={refresh} />
+          <OpenAccountForm onOpened={refresh} defaultName={user.username} />
         </section>
 
         <section className="card">
@@ -94,15 +102,14 @@ function OutcomeView({ outcome }: { outcome: TransferOutcome }) {
   )
 }
 
-function OpenAccountForm({ onOpened }: { onOpened: () => void }) {
-  const [name, setName] = useState('')
+function OpenAccountForm({ onOpened, defaultName }: { onOpened: () => void; defaultName: string }) {
+  const [name, setName] = useState(defaultName)
   const [deposit, setDeposit] = useState('1000000')
 
   const submit = async (e: FormEvent) => {
     e.preventDefault()
     if (!name.trim()) return
     await api.openAccount(name.trim(), Number(deposit) || 0)
-    setName('')
     onOpened()
   }
 
@@ -131,7 +138,8 @@ function TransferForm({
   const [busy, setBusy] = useState(false)
 
   const fromId = from || accounts[0]?.id || ''
-  const toId = to || accounts[1]?.id || ''
+  // Any account ID: one of yours, or one someone shared with you.
+  const toId = to.trim()
   const input = { fromAccountId: fromId, toAccountId: toId, amount: Number(amount), description: description || undefined }
 
   const run = async (label: string, calls: () => Promise<TransferOutcome>[]) => {
@@ -168,10 +176,11 @@ function TransferForm({
         </select>
       </label>
       <label>
-        To
-        <select value={toId} onChange={(e) => setTo(e.target.value)}>
-          {accounts.map((a) => <option key={a.id} value={a.id}>{a.ownerName}</option>)}
-        </select>
+        To (account ID)
+        <input list="own-accounts" value={to} onChange={(e) => setTo(e.target.value)} placeholder="paste the recipient's account ID" />
+        <datalist id="own-accounts">
+          {accounts.filter((a) => a.id !== fromId).map((a) => <option key={a.id} value={a.id}>{a.ownerName}</option>)}
+        </datalist>
       </label>
       <label>
         Amount (IDR)
@@ -182,8 +191,8 @@ function TransferForm({
         <input maxLength={140} value={description} onChange={(e) => setDescription(e.target.value)} placeholder="optional" />
       </label>
       <div className="row">
-        <button type="submit" disabled={busy || accounts.length < 2}>Send</button>
-        <button type="button" className="secondary" disabled={busy || accounts.length < 2} onClick={doubleTap}>
+        <button type="submit" disabled={busy || !fromId || !toId}>Send</button>
+        <button type="button" className="secondary" disabled={busy || !fromId || !toId} onClick={doubleTap}>
           Double-tap
         </button>
       </div>

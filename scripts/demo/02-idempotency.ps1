@@ -18,9 +18,10 @@ if ($PSVersionTable.PSVersion.Major -ge 7) {
   $k = "demo-tap-$run"
   $body = @{ fromAccountId = $alice.id; toAccountId = $bob.id; amount = 1000 } | ConvertTo-Json
   $url = "$api/transfers"
+  $token = Get-KirimToken alice
   1..5 | ForEach-Object -Parallel {
     $r = Invoke-WebRequest -Method Post $using:url -ContentType "application/json" `
-           -Headers @{ "Idempotency-Key" = $using:k } -Body $using:body -SkipHttpErrorCheck
+           -Headers @{ "Idempotency-Key" = $using:k; Authorization = "Bearer $($using:token)" } -Body $using:body -SkipHttpErrorCheck
     "$([int]$r.StatusCode) replayed=$($r.Headers['Idempotent-Replayed'])"
   } | Sort-Object
   Expect "one 201, four 200 replayed=true; Alice is charged 1000 once"

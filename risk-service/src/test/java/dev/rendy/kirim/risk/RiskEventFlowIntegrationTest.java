@@ -2,6 +2,7 @@ package dev.rendy.kirim.risk;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
+import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.jwt;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
@@ -27,6 +28,8 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.kafka.core.ConsumerFactory;
 import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.security.core.authority.SimpleGrantedAuthority;
+import org.springframework.test.web.servlet.request.RequestPostProcessor;
 import org.springframework.test.web.servlet.MockMvc;
 
 /**
@@ -37,6 +40,7 @@ class RiskEventFlowIntegrationTest extends IntegrationTest {
 
     private static final Instant NOON_JAKARTA = Instant.parse("2026-03-10T05:00:00Z");
     private static final LocalDate DAY = LocalDate.parse("2026-03-10");
+    private static final RequestPostProcessor OPS = jwt().authorities(new SimpleGrantedAuthority("ROLE_OPS"));
 
     @Autowired KafkaTemplate<String, String> kafka;
     @Autowired ConsumerFactory<String, String> consumerFactory;
@@ -121,11 +125,11 @@ class RiskEventFlowIntegrationTest extends IntegrationTest {
         send(completed(alice, 75_000, Instant.parse("2026-01-01T18:00:00Z")));
 
         awaitDailyCount(alice, LocalDate.parse("2026-01-02"), 1);
-        mockMvc.perform(get("/api/v1/accounts/{id}/daily-activity", alice).param("day", "2026-01-02"))
+        mockMvc.perform(get("/api/v1/accounts/{id}/daily-activity", alice).param("day", "2026-01-02").with(OPS))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.totalAmount").value(75_000))
                 .andExpect(jsonPath("$.transferCount").value(1));
-        mockMvc.perform(get("/api/v1/accounts/{id}/daily-activity", alice).param("day", "2026-01-01"))
+        mockMvc.perform(get("/api/v1/accounts/{id}/daily-activity", alice).param("day", "2026-01-01").with(OPS))
                 .andExpect(jsonPath("$.transferCount").value(0));
     }
 

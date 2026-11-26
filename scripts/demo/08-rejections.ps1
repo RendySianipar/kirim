@@ -2,7 +2,7 @@
 # A rejection (no money, over the limit) is a recorded transfer with status REJECTED (201),
 # so a retry gets the same answer. A validation error records nothing and is a Problem Details error.
 
-$dave = Open-Account "Dave $run" 0
+$dave = Open-Account "Dave $run" 0 -As dave
 
 Step "Business rejections"
 $k = "demo-reject-$run"
@@ -19,5 +19,5 @@ Expect "400 INVALID_REQUEST (same account) | 404 ACCOUNT_NOT_FOUND | 400 (amount
 
 Start-Sleep 2
 Step "Dave's notification (via Kafka)"
-Invoke-RestMethod "$api/accounts/$($dave.id)/notifications" | Format-Table message -AutoSize
+Invoke-Kirim "$api/accounts/$($dave.id)/notifications" -As dave | Format-Table message -AutoSize
 Expect "'Your transfer of IDR 1,000 was rejected (INSUFFICIENT_FUNDS)'"

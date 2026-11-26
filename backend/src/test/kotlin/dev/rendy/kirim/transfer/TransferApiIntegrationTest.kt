@@ -5,6 +5,7 @@ import dev.rendy.kirim.account.AccountService
 import dev.rendy.kirim.account.LedgerRepository
 import dev.rendy.kirim.outbox.OutboxRepository
 import dev.rendy.kirim.outbox.OutboxStatus
+import dev.rendy.kirim.support.Auth
 import dev.rendy.kirim.support.IntegrationTest
 import org.junit.jupiter.api.Test
 import org.springframework.beans.factory.annotation.Autowired
@@ -28,6 +29,7 @@ class TransferApiIntegrationTest : IntegrationTest() {
         objectMapper.writeValueAsString(mapOf("fromAccountId" to from, "toAccountId" to to, "amount" to amount, "description" to description))
 
     private fun postTransfer(key: String?, json: String) = mockMvc.post("/api/v1/transfers") {
+        with(Auth.customer(ALICE))
         contentType = MediaType.APPLICATION_JSON
         if (key != null) header("Idempotency-Key", key)
         content = json
@@ -35,8 +37,8 @@ class TransferApiIntegrationTest : IntegrationTest() {
 
     @Test
     fun `completes a transfer, moves money once and records the ledger and outbox`() {
-        val alice = accounts.open("Alice", "IDR", 100_000)
-        val bob = accounts.open("Bob", "IDR", 0)
+        val alice = accounts.open("Alice", "IDR", ownerId = ALICE, openingBalance = 100_000)
+        val bob = accounts.open("Bob", "IDR", ownerId = BOB, openingBalance = 0)
 
         val result = postTransfer("key-1", body(alice.id, bob.id, 40_000, "lunch"))
             .andExpect {
@@ -60,8 +62,8 @@ class TransferApiIntegrationTest : IntegrationTest() {
 
     @Test
     fun `retrying with the same key replays the original result without moving money again`() {
-        val alice = accounts.open("Alice", "IDR", 100_000)
-        val bob = accounts.open("Bob", "IDR", 0)
+        val alice = accounts.open("Alice", "IDR", ownerId = ALICE, openingBalance = 100_000)
+        val bob = accounts.open("Bob", "IDR", ownerId = BOB, openingBalance = 0)
         val json = body(alice.id, bob.id, 25_000)
 
         val first = postTransfer("retry-key", json).andExpect { status { isCreated() } }.andReturn()
@@ -81,8 +83,8 @@ class TransferApiIntegrationTest : IntegrationTest() {
 
     @Test
     fun `reusing a key with a different body is rejected with 422`() {
-        val alice = accounts.open("Alice", "IDR", 100_000)
-        val bob = accounts.open("Bob", "IDR", 0)
+        val alice = accounts.open("Alice", "IDR", ownerId = ALICE, openingBalance = 100_000)
+        val bob = accounts.open("Bob", "IDR", ownerId = BOB, openingBalance = 0)
 
         postTransfer("same-key", body(alice.id, bob.id, 10_000)).andExpect { status { isCreated() } }
         postTransfer("same-key", body(alice.id, bob.id, 99_000))
@@ -96,8 +98,8 @@ class TransferApiIntegrationTest : IntegrationTest() {
 
     @Test
     fun `insufficient funds produces a REJECTED transfer and leaves balances untouched`() {
-        val alice = accounts.open("Alice", "IDR", 5_000)
-        val bob = accounts.open("Bob", "IDR", 0)
+        val alice = accounts.open("Alice", "IDR", ownerId = ALICE, openingBalance = 5_000)
+        val bob = accounts.open("Bob", "IDR", ownerId = BOB, openingBalance = 0)
 
         postTransfer("poor-key", body(alice.id, bob.id, 10_000))
             .andExpect {
@@ -112,16 +114,16 @@ class TransferApiIntegrationTest : IntegrationTest() {
 
     @Test
     fun `missing Idempotency-Key header is a 400`() {
-        val alice = accounts.open("Alice", "IDR", 5_000)
-        val bob = accounts.open("Bob", "IDR", 0)
+        val alice = accounts.open("Alice", "IDR", ownerId = ALICE, openingBalance = 5_000)
+        val bob = accounts.open("Bob", "IDR", ownerId = BOB, openingBalance = 0)
 
         postTransfer(null, body(alice.id, bob.id, 1_000)).andExpect { status { isBadRequest() } }
     }
 
     @Test
     fun `invalid amount is a 400 problem detail`() {
-        val alice = accounts.open("Alice", "IDR", 5_000)
-        val bob = accounts.open("Bob", "IDR", 0)
+        val alice = accounts.open("Alice", "IDR", ownerId = ALICE, openingBalance = 5_000)
+        val bob = accounts.open("Bob", "IDR", ownerId = BOB, openingBalance = 0)
 
         postTransfer("zero-key", body(alice.id, bob.id, 0))
             .andExpect {
@@ -132,7 +134,7 @@ class TransferApiIntegrationTest : IntegrationTest() {
 
     @Test
     fun `unknown account is a 404 and does not burn the idempotency key`() {
-        val alice = accounts.open("Alice", "IDR", 5_000)
+        val alice = accounts.open("Alice", "IDR", ownerId = ALICE, openingBalance = 5_000)
         val ghost = UUID.randomUUID()
 
         postTransfer("ghost-key", body(alice.id, ghost, 1_000))
@@ -142,17 +144,17 @@ class TransferApiIntegrationTest : IntegrationTest() {
             }
 
         // The failed attempt rolled back, so the same key works once the request is fixed.
-        val bob = accounts.open("Bob", "IDR", 0)
+        val bob = accounts.open("Bob", "IDR", ownerId = BOB, openingBalance = 0)
         postTransfer("ghost-key", body(alice.id, bob.id, 1_000)).andExpect { status { isCreated() } }
     }
 
     @Test
     fun `account statement lists ledger entries newest first`() {
-        val alice = accounts.open("Alice", "IDR", 50_000)
-        val bob = accounts.open("Bob", "IDR", 0)
+        val alice = accounts.open("Alice", "IDR", ownerId = ALICE, openingBalance = 50_000)
+        val bob = accounts.open("Bob", "IDR", ownerId = BOB, openingBalance = 0)
         postTransfer("stmt-key", body(alice.id, bob.id, 20_000)).andExpect { status { isCreated() } }
 
-        mockMvc.get("/api/v1/accounts/${alice.id}/entries")
+        mockMvc.get("/api/v1/accounts/${alice.id}/entries") { with(Auth.customer(ALICE)) }
             .andExpect {
                 status { isOk() }
                 jsonPath("$.length()") { value(2) }
@@ -160,5 +162,10 @@ class TransferApiIntegrationTest : IntegrationTest() {
                 jsonPath("$[0].balanceAfter") { value(30_000) }
                 jsonPath("$[1].type") { value("CREDIT") }
             }
+    }
+
+    private companion object {
+        const val ALICE = "alice-sub"
+        const val BOB = "bob-sub"
     }
 }

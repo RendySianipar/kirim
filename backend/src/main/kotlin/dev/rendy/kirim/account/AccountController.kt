@@ -1,5 +1,7 @@
 package dev.rendy.kirim.account
 
+import dev.rendy.kirim.security.AccountAccess
+import dev.rendy.kirim.security.CurrentUser
 import jakarta.validation.Valid
 import jakarta.validation.constraints.Max
 import jakarta.validation.constraints.Min
@@ -37,9 +39,11 @@ data class AccountResponse(
     val currency: String,
     val balance: Long,
     val createdAt: Instant,
+    /** Keycloak user id of the owner (null for accounts from before authentication). */
+    val ownerId: String?,
 ) {
     companion object {
-        fun from(a: Account) = AccountResponse(a.id, a.ownerName, a.currency, a.balance, a.createdAt)
+        fun from(a: Account) = AccountResponse(a.id, a.ownerName, a.currency, a.balance, a.createdAt, a.ownerId)
     }
 }
 
@@ -58,22 +62,35 @@ data class LedgerEntryResponse(
 
 @RestController
 @RequestMapping("/api/v1/accounts")
-class AccountController(private val service: AccountService) {
+class AccountController(
+    private val service: AccountService,
+    private val access: AccountAccess,
+    private val currentUser: CurrentUser,
+) {
 
+    /** The new account belongs to the caller: the owner comes from the token, never from the request body. */
     @PostMapping
     @ResponseStatus(HttpStatus.CREATED)
     fun open(@Valid @RequestBody request: OpenAccountRequest): AccountResponse =
-        AccountResponse.from(service.open(request.ownerName, request.currency, request.openingBalance))
+        AccountResponse.from(service.open(request.ownerName, request.currency, request.openingBalance, currentUser.get().subject))
 
+    /** Customers see their own accounts; OPS sees all. */
     @GetMapping
-    fun list(): List<AccountResponse> = service.list().map { AccountResponse.from(it) }
+    fun list(): List<AccountResponse> {
+        val caller = currentUser.get()
+        val accounts = if (caller.isOps) service.list() else service.listByOwner(caller.subject)
+        return accounts.map { AccountResponse.from(it) }
+    }
 
     @GetMapping("/{id}")
-    fun get(@PathVariable id: UUID): AccountResponse = AccountResponse.from(service.get(id))
+    fun get(@PathVariable id: UUID): AccountResponse = AccountResponse.from(access.requireReadable(id))
 
     @GetMapping("/{id}/entries")
     fun statement(
         @PathVariable id: UUID,
         @RequestParam(defaultValue = "20") @Min(1) @Max(100) limit: Int,
-    ): List<LedgerEntryResponse> = service.statement(id, limit).map { LedgerEntryResponse.from(it) }
+    ): List<LedgerEntryResponse> {
+        access.requireReadable(id)
+        return service.statement(id, limit).map { LedgerEntryResponse.from(it) }
+    }
 }

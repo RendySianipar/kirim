@@ -33,8 +33,13 @@ configMapGenerator:
       - SPRING_KAFKA_BOOTSTRAP_SERVERS=kafka:9092
       - SPRING_DATA_REDIS_HOST=redis
       - SERVER_SHUTDOWN=graceful
+      # Keycloak is not part of these manifests yet: point these at your identity provider.
+      - SPRING_SECURITY_OAUTH2_RESOURCESERVER_JWT_ISSUER_URI=http://localhost/auth/realms/kirim
+      - SPRING_SECURITY_OAUTH2_RESOURCESERVER_JWT_JWK_SET_URI=http://keycloak/auth/realms/kirim/protocol/openid-connect/certs
   - name: risk-service-config
     literals:
       - SPRING_DATASOURCE_URL=jdbc:postgresql://postgres:5432/kirim_risk
       - SPRING_KAFKA_BOOTSTRAP_SERVERS=kafka:9092
       - SERVER_SHUTDOWN=graceful
+      - SPRING_SECURITY_OAUTH2_RESOURCESERVER_JWT_ISSUER_URI=http://localhost/auth/realms/kirim
+      - SPRING_SECURITY_OAUTH2_RESOURCESERVER_JWT_JWK_SET_URI=http://keycloak/auth/realms/kirim/protocol/openid-connect/certs

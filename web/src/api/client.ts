@@ -1,3 +1,4 @@
+import { authFetch } from '../auth'
 import { sendWithRetry } from './retry'
 
 export interface Account {
@@ -6,6 +7,7 @@ export interface Account {
   currency: string
   balance: number
   createdAt: string
+  ownerId: string | null
 }
 
 export interface LedgerEntry {
@@ -81,16 +83,16 @@ const json = (body: unknown): RequestInit => ({
 })
 
 export const api = {
-  listAccounts: () => fetch('/api/v1/accounts').then((r) => parse<Account[]>(r)),
+  listAccounts: () => authFetch('/api/v1/accounts').then((r) => parse<Account[]>(r)),
 
   openAccount: (ownerName: string, openingBalance: number) =>
-    fetch('/api/v1/accounts', json({ ownerName, openingBalance, currency: 'IDR' })).then((r) => parse<Account>(r)),
+    authFetch('/api/v1/accounts', json({ ownerName, openingBalance, currency: 'IDR' })).then((r) => parse<Account>(r)),
 
   entries: (accountId: string) =>
-    fetch(`/api/v1/accounts/${accountId}/entries?limit=10`).then((r) => parse<LedgerEntry[]>(r)),
+    authFetch(`/api/v1/accounts/${accountId}/entries?limit=10`).then((r) => parse<LedgerEntry[]>(r)),
 
   notifications: (accountId: string) =>
-    fetch(`/api/v1/accounts/${accountId}/notifications`).then((r) => parse<Notification[]>(r)),
+    authFetch(`/api/v1/accounts/${accountId}/notifications`).then((r) => parse<Notification[]>(r)),
 
   /**
    * One key per user intent: generated once, reused across every retry.
@@ -98,7 +100,7 @@ export const api = {
    */
   async transfer(input: TransferInput, idempotencyKey: string = crypto.randomUUID()): Promise<TransferOutcome> {
     const response = await sendWithRetry(() =>
-      fetch('/api/v1/transfers', {
+      authFetch('/api/v1/transfers', {
         ...json({ ...input, currency: 'IDR' }),
         headers: { 'Content-Type': 'application/json', 'Idempotency-Key': idempotencyKey },
       }),

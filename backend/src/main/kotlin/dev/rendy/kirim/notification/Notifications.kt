@@ -7,6 +7,7 @@ import dev.rendy.kirim.common.toTimestamp
 import dev.rendy.kirim.common.uuid
 import dev.rendy.kirim.outbox.TransferEvent
 import dev.rendy.kirim.outbox.TransferEventType
+import dev.rendy.kirim.security.AccountAccess
 import org.apache.kafka.clients.consumer.ConsumerRecord
 import org.slf4j.LoggerFactory
 import org.springframework.jdbc.core.RowMapper
@@ -116,9 +117,14 @@ class TransferEventListener(private val service: NotificationService) {
 data class NotificationResponse(val id: UUID, val message: String, val createdAt: Instant)
 
 @RestController
-class NotificationController(private val service: NotificationService) {
+class NotificationController(
+    private val service: NotificationService,
+    private val access: AccountAccess,
+) {
 
     @GetMapping("/api/v1/accounts/{id}/notifications")
-    fun list(@PathVariable id: UUID): List<NotificationResponse> =
-        service.forAccount(id).map { NotificationResponse(it.id, it.message, it.createdAt) }
+    fun list(@PathVariable id: UUID): List<NotificationResponse> {
+        access.requireReadable(id)
+        return service.forAccount(id).map { NotificationResponse(it.id, it.message, it.createdAt) }
+    }
 }

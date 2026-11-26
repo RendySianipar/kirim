@@ -10,6 +10,8 @@ data class Account(
     /** Minor units (whole Rupiah for IDR). */
     val balance: Long,
     val createdAt: Instant,
+    /** Keycloak user id (`sub`) of the owner; null for accounts opened before authentication existed. */
+    val ownerId: String? = null,
 )
 
 enum class EntryType { DEBIT, CREDIT }
