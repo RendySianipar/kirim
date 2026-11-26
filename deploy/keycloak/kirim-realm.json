@@ -1,0 +1,103 @@
+{
+  "realm": "kirim",
+  "displayName": "Kirim",
+  "enabled": true,
+  "sslRequired": "none",
+  "registrationAllowed": false,
+  "loginWithEmailAllowed": true,
+  "bruteForceProtected": true,
+  "accessTokenLifespan": 300,
+  "roles": {
+    "realm": [
+      { "name": "customer", "description": "Owns accounts and sends money from them" },
+      { "name": "ops", "description": "Operations and compliance: reads all accounts, runs reconciliations, sees risk alerts; cannot move customer money" }
+    ]
+  },
+  "clients": [
+    {
+      "clientId": "kirim-web",
+      "name": "Kirim web app",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "redirectUris": ["http://localhost/*", "http://localhost:5173/*", "http://localhost:8088/*"],
+      "webOrigins": ["+"],
+      "attributes": {
+        "pkce.code.challenge.method": "S256",
+        "post.logout.redirect.uris": "+"
+      }
+    },
+    {
+      "clientId": "kirim-cli",
+      "name": "Kirim demo scripts (password grant, development only)",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": true,
+      "standardFlowEnabled": false,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": true,
+      "serviceAccountsEnabled": false
+    }
+  ],
+  "users": [
+    {
+      "id": "8b0e2f6e-2d0c-4a39-9a51-1a9d1d7a0001",
+      "username": "alice",
+      "enabled": true,
+      "email": "alice@kirim.local",
+      "emailVerified": true,
+      "firstName": "Alice",
+      "lastName": "Demo",
+      "credentials": [{ "type": "password", "value": "alice", "temporary": false }],
+      "realmRoles": ["customer"]
+    },
+    {
+      "id": "8b0e2f6e-2d0c-4a39-9a51-1a9d1d7a0002",
+      "username": "bob",
+      "enabled": true,
+      "email": "bob@kirim.local",
+      "emailVerified": true,
+      "firstName": "Bob",
+      "lastName": "Demo",
+      "credentials": [{ "type": "password", "value": "bob", "temporary": false }],
+      "realmRoles": ["customer"]
+    },
+    {
+      "id": "8b0e2f6e-2d0c-4a39-9a51-1a9d1d7a0003",
+      "username": "carol",
+      "enabled": true,
+      "email": "carol@kirim.local",
+      "emailVerified": true,
+      "firstName": "Carol",
+      "lastName": "Demo",
+      "credentials": [{ "type": "password", "value": "carol", "temporary": false }],
+      "realmRoles": ["customer"]
+    },
+    {
+      "id": "8b0e2f6e-2d0c-4a39-9a51-1a9d1d7a0004",
+      "username": "dave",
+      "enabled": true,
+      "email": "dave@kirim.local",
+      "emailVerified": true,
+      "firstName": "Dave",
+      "lastName": "Demo",
+      "credentials": [{ "type": "password", "value": "dave", "temporary": false }],
+      "realmRoles": ["customer"]
+    },
+    {
+      "id": "8b0e2f6e-2d0c-4a39-9a51-1a9d1d7a0009",
+      "username": "ops",
+      "enabled": true,
+      "email": "ops@kirim.local",
+      "emailVerified": true,
+      "firstName": "Ops",
+      "lastName": "Team",
+      "credentials": [{ "type": "password", "value": "ops", "temporary": false }],
+      "realmRoles": ["ops"]
+    }
+  ]
+}

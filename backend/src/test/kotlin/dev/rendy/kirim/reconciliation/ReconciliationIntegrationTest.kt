@@ -2,6 +2,7 @@ package dev.rendy.kirim.reconciliation
 
 import dev.rendy.kirim.account.Account
 import dev.rendy.kirim.account.AccountService
+import dev.rendy.kirim.support.Auth
 import dev.rendy.kirim.support.IntegrationTest
 import dev.rendy.kirim.transfer.Transfer
 import dev.rendy.kirim.transfer.TransferCommand
@@ -185,7 +186,7 @@ class ReconciliationIntegrationTest : IntegrationTest() {
         val books = books()
         jdbc.sql("UPDATE accounts SET balance = balance + 1 WHERE id = :id").param("id", books.alice.id).update()
 
-        val body = mockMvc.post("/api/v1/reconciliations?date=${books.day}").andExpect {
+        val body = mockMvc.post("/api/v1/reconciliations?date=${books.day}") { with(Auth.ops()) }.andExpect {
             status { isCreated() }
             jsonPath("$.run.status") { value("MISMATCH") }
             jsonPath("$.run.businessDate") { value(books.day.toString()) }
@@ -194,19 +195,19 @@ class ReconciliationIntegrationTest : IntegrationTest() {
         }.andReturn().response.contentAsString
         val runId = Regex("\"id\":\"([0-9a-f-]{36})\"").find(body)!!.groupValues[1]
 
-        mockMvc.get("/api/v1/reconciliations/$runId").andExpect {
+        mockMvc.get("/api/v1/reconciliations/$runId") { with(Auth.ops()) }.andExpect {
             status { isOk() }
             jsonPath("$.mismatches[*].kind") { value(org.hamcrest.Matchers.hasItem("BALANCE_MISMATCH")) }
         }
-        mockMvc.get("/api/v1/reconciliations").andExpect {
+        mockMvc.get("/api/v1/reconciliations") { with(Auth.ops()) }.andExpect {
             status { isOk() }
             jsonPath("$[0].id") { value(runId) }
         }
-        mockMvc.post("/api/v1/reconciliations?date=${books.day.plusDays(2)}").andExpect {
+        mockMvc.post("/api/v1/reconciliations?date=${books.day.plusDays(2)}") { with(Auth.ops()) }.andExpect {
             status { isBadRequest() }
             jsonPath("$.code") { value("INVALID_REQUEST") }
         }
-        mockMvc.get("/api/v1/reconciliations/${UUID.randomUUID()}").andExpect {
+        mockMvc.get("/api/v1/reconciliations/${UUID.randomUUID()}") { with(Auth.ops()) }.andExpect {
             status { isNotFound() }
             jsonPath("$.code") { value("RECONCILIATION_RUN_NOT_FOUND") }
         }

@@ -14,12 +14,12 @@ class AccountService(
 ) {
 
     @Transactional
-    fun open(ownerName: String, currency: String, openingBalance: Long): Account {
+    fun open(ownerName: String, currency: String, openingBalance: Long, ownerId: String? = null): Account {
         require(ownerName.isNotBlank()) { "ownerName must not be blank" }
         require(openingBalance >= 0) { "openingBalance must not be negative" }
 
         val now = clock.instant()
-        val account = Account(UUID.randomUUID(), ownerName.trim(), currency, openingBalance, now)
+        val account = Account(UUID.randomUUID(), ownerName.trim(), currency, openingBalance, now, ownerId)
         accounts.insert(account)
 
         if (openingBalance > 0) {
@@ -35,6 +35,9 @@ class AccountService(
 
     @Transactional(readOnly = true)
     fun list(): List<Account> = accounts.findAll()
+
+    @Transactional(readOnly = true)
+    fun listByOwner(ownerId: String): List<Account> = accounts.findByOwner(ownerId)
 
     @Transactional(readOnly = true)
     fun statement(id: UUID, limit: Int): List<LedgerEntry> {

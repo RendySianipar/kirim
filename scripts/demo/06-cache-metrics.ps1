@@ -8,8 +8,8 @@ Expect "0"
 
 Step "Read it twice: miss, then hit"
 $before = Get-Metric 'kirim_cache_total'
-Invoke-RestMethod "$api/transfers/$($t.Id)" | Format-List id, amount, status
-Invoke-RestMethod "$api/transfers/$($t.Id)" | Format-List id, amount, status
+Invoke-Kirim "$api/transfers/$($t.Id)" -As bob | Format-List id, amount, status
+Invoke-Kirim "$api/transfers/$($t.Id)" -As bob | Format-List id, amount, status
 $after = Get-Metric 'kirim_cache_total'
 "before:"; $before
 "after:";  $after

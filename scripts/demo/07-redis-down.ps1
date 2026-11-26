@@ -11,7 +11,7 @@ try {
 
   if ($t) {
     Step "Reading a transfer falls back to PostgreSQL"
-    Invoke-RestMethod "$api/transfers/$($t.Id)" | Format-List id, status
+    Invoke-Kirim "$api/transfers/$($t.Id)" -As bob | Format-List id, status
   }
 
   Step "Health"

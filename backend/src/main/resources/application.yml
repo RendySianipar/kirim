@@ -1,3 +1,7 @@
+server:
+  # Behind the reverse proxy: build links (Swagger, redirects) from X-Forwarded-* headers.
+  forward-headers-strategy: framework
+
 spring:
   application:
     name: kirim
@@ -13,6 +17,16 @@ spring:
       # hold the transfer transaction (and its row locks) for long.
       timeout: 500ms
       connect-timeout: 500ms
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          # Tokens are issued by Keycloak (realm "kirim"). The issuer is the PUBLIC
+          # URL clients log in through (via the reverse proxy); the keys are fetched
+          # from wherever this service can reach Keycloak. In docker-compose both are
+          # set by environment variables; these defaults fit running from IntelliJ.
+          issuer-uri: http://localhost/auth/realms/kirim
+          jwk-set-uri: http://localhost/auth/realms/kirim/protocol/openid-connect/certs
   kafka:
     bootstrap-servers: localhost:9092
     producer:

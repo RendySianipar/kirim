@@ -1,6 +1,10 @@
 package dev.rendy.kirim.transfer
 
+import dev.rendy.kirim.account.AccountService
 import dev.rendy.kirim.common.InvalidRequestException
+import dev.rendy.kirim.common.TransferNotFoundException
+import dev.rendy.kirim.security.AccountAccess
+import dev.rendy.kirim.security.CurrentUser
 import jakarta.validation.Valid
 import jakarta.validation.constraints.Pattern
 import jakarta.validation.constraints.Positive
@@ -53,7 +57,12 @@ data class TransferResponse(
 
 @RestController
 @RequestMapping("/api/v1/transfers")
-class TransferController(private val service: TransferService) {
+class TransferController(
+    private val service: TransferService,
+    private val accounts: AccountService,
+    private val access: AccountAccess,
+    private val currentUser: CurrentUser,
+) {
 
     /**
      * Clients send a unique Idempotency-Key per logical transfer (e.g. a UUID
@@ -74,6 +83,9 @@ class TransferController(private val service: TransferService) {
         if (idempotencyKey.isBlank() || idempotencyKey.length > 100) {
             throw InvalidRequestException("Idempotency-Key must be 1-100 characters")
         }
+        // Ownership is checked before the idempotency key is looked at, so another
+        // user's key can never be used to read or replay someone else's transfer.
+        access.requireOwned(request.fromAccountId)
         val result = service.transfer(idempotencyKey, request.toCommand())
         val body = TransferResponse.from(result.transfer)
         return if (result.replayed) {
@@ -83,8 +95,17 @@ class TransferController(private val service: TransferService) {
         }
     }
 
+    /** Visible to the sender, the receiver and OPS; anyone else gets 404. */
     @GetMapping("/{id}")
-    fun get(@PathVariable id: UUID): TransferResponse = TransferResponse.from(service.get(id))
+    fun get(@PathVariable id: UUID): TransferResponse {
+        val transfer = service.get(id)
+        val caller = currentUser.get()
+        val visible = caller.isOps ||
+            access.canRead(accounts.get(transfer.fromAccountId), caller) ||
+            access.canRead(accounts.get(transfer.toAccountId), caller)
+        if (!visible) throw TransferNotFoundException(id)
+        return TransferResponse.from(transfer)
+    }
 
     companion object {
         const val REPLAYED_HEADER = "Idempotent-Replayed"

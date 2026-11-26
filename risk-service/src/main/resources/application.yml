@@ -1,5 +1,7 @@
 server:
   port: 8081
+  # Behind the reverse proxy at /risk: build links (Swagger) from X-Forwarded-* headers.
+  forward-headers-strategy: framework
 
 spring:
   application:
@@ -10,6 +12,13 @@ spring:
     url: jdbc:postgresql://localhost:5433/kirim_risk
     username: kirim
     password: kirim
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          # Same Keycloak realm as the transfer API; see its application.yml.
+          issuer-uri: http://localhost/auth/realms/kirim
+          jwk-set-uri: http://localhost/auth/realms/kirim/protocol/openid-connect/certs
   kafka:
     bootstrap-servers: localhost:9092
     consumer:

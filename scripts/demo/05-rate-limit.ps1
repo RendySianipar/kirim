@@ -33,5 +33,5 @@ Expect "201 COMPLETED with the same key, then 200 Replayed=true"
 Step "Bonus: the 20th transfer today raises HIGH_DAILY_COUNT"
 1..9 | ForEach-Object { Send-Transfer $carol.id $bob.id 10000 } | Format-Table Http, Status -AutoSize
 Start-Sleep 3
-Invoke-RestMethod "$risk/alerts?accountId=$($carol.id)" | Format-Table rule, details -AutoSize
+Invoke-Kirim "$risk/alerts?accountId=$($carol.id)" -As ops | Format-Table rule, details -AutoSize
 Expect "one HIGH_DAILY_COUNT alert: '20 transfers today (threshold 20)'"

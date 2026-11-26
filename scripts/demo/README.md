@@ -22,7 +22,7 @@ Dot-source every script (the leading `. `), so `$alice`, `$bob`, `Send-Transfer`
 
 | Script | Feature | What it shows |
 | --- | --- | --- |
-| `01-setup.ps1` | Accounts | Waits for both services to be ready, defines the helpers, opens Alice (Rp 200 juta), Bob and Carol (Rp 1 juta) |
+| `01-setup.ps1` | Accounts, login | Waits for both services and Keycloak, logs in as alice, bob, carol and ops, defines the helpers, opens one account per user: Alice (Rp 200 juta), Bob and Carol (Rp 1 juta) |
 | `02-idempotency.ps1` | Idempotent transfers | Same key: `201`, then `200` replayed, then `422` for a changed body; money moves once; 5 simultaneous taps (PowerShell 7) |
 | `03-outbox-kafka.ps1` | Ledger, outbox, Kafka | Ledger entries, outbox rows `PUBLISHED`, events on `transfer-events`, two consumer groups, notifications |
 | `03b-kafka-down.ps1` | Outbox resilience | **Stops Kafka**: the transfer still succeeds, the event waits as `PENDING` and is sent after Kafka is back |
@@ -32,15 +32,21 @@ Dot-source every script (the leading `. `), so `$alice`, `$bob`, `Send-Transfer`
 | `07-redis-down.ps1` | Fail open | **Stops Redis**: transfers still work, readiness stays `UP`, overall health `DOWN` |
 | `08-rejections.ps1` | Errors | `REJECTED` transfers (insufficient funds, over Rp 50 juta) vs. `400`/`404` validation errors |
 | `09-reconciliation.ps1` | Daily reconciliation | Books `MATCHED`; a balance changed by hand is caught as `BALANCE_MISMATCH` + `MONEY_NOT_CONSERVED`; repaired → `MATCHED`; run history and metrics |
+| `10-security.ps1` | Authentication, authorization, reverse proxy | Token claims; 401 without or with a tampered token; customers see only their own accounts; ops can look but not move money; OPS-only endpoints; `X-Request-Id`; actuator hidden behind the proxy |
 
 `09` changes one balance on purpose and puts it back. `03b` and `07` stop a container and start it again in a `finally` block, so it comes back even if the script fails halfway.
 
+## Users
+
+The development realm (`deploy/keycloak/kirim-realm.json`) has `alice`, `bob`, `carol`, `dave` (role `customer`) and `ops` (role `ops`); each password equals the username. Every request carries the token of the user who owns the account; risk alerts and reconciliation run as `ops`.
+
 ## Ports
 
-The scripts read `API_PORT` from the repo's `.env` (the same file `docker compose` reads), default `8080`. The risk service is always on `8081`. If a port is taken on your machine:
+Requests go through the reverse proxy, `http://localhost` (or `PROXY_PORT` from the repo's `.env`). Health and metrics are read from the services' own ports (`API_PORT`, default `8080`, and `8081`), because the proxy does not expose actuator. To call an API running in IntelliJ directly, set `$env:KIRIM_API_URL = 'http://localhost:8090'` before `01-setup.ps1`. If a port is taken on your machine:
 
 ```powershell
 Set-Content -Path .env -Value "API_PORT=8090","REDIS_PORT=6380" -Encoding ascii
+# port 80 taken too? add: "PROXY_PORT=8088","KIRIM_PUBLIC_URL=http://localhost:8088"
 docker compose up -d --force-recreate
 ```
 

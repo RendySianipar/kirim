@@ -2,6 +2,7 @@ package dev.rendy.kirim.ratelimit
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import dev.rendy.kirim.account.AccountService
+import dev.rendy.kirim.support.Auth
 import dev.rendy.kirim.support.IntegrationTest
 import org.junit.jupiter.api.Test
 import org.springframework.beans.factory.annotation.Autowired
@@ -24,7 +25,8 @@ class RateLimitApiIntegrationTest : IntegrationTest() {
     @Autowired lateinit var objectMapper: ObjectMapper
     @Autowired lateinit var accounts: AccountService
 
-    private fun postTransfer(key: String, from: UUID, to: UUID, amount: Long) = mockMvc.post("/api/v1/transfers") {
+    private fun postTransfer(key: String, from: UUID, to: UUID, amount: Long, user: String = "alice-sub") = mockMvc.post("/api/v1/transfers") {
+        with(Auth.customer(user))
         contentType = MediaType.APPLICATION_JSON
         header("Idempotency-Key", key)
         content = objectMapper.writeValueAsString(mapOf("fromAccountId" to from, "toAccountId" to to, "amount" to amount))
@@ -32,8 +34,8 @@ class RateLimitApiIntegrationTest : IntegrationTest() {
 
     @Test
     fun `over the limit is a 429 with Retry-After, replays are free and the rejected key is not burned`() {
-        val alice = accounts.open("Alice", "IDR", 100_000)
-        val bob = accounts.open("Bob", "IDR", 0)
+        val alice = accounts.open("Alice", "IDR", 100_000, ownerId = "alice-sub")
+        val bob = accounts.open("Bob", "IDR", 0, ownerId = "bob-sub")
 
         postTransfer("rl-1", alice.id, bob.id, 1_000).andExpect { status { isCreated() } }
         postTransfer("rl-2", alice.id, bob.id, 1_000).andExpect { status { isCreated() } }
@@ -54,6 +56,6 @@ class RateLimitApiIntegrationTest : IntegrationTest() {
         assertEquals(0L, keyRows, "the rejected request rolled back, so the client can retry with the same key later")
 
         // Bob has his own quota.
-        postTransfer("rl-bob", bob.id, alice.id, 500).andExpect { status { isCreated() } }
+        postTransfer("rl-bob", bob.id, alice.id, 500, user = "bob-sub").andExpect { status { isCreated() } }
     }
 }

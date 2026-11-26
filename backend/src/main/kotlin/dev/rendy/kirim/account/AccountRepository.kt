@@ -19,17 +19,19 @@ class AccountRepository(private val jdbc: JdbcClient) {
             currency = rs.getString("currency"),
             balance = rs.getLong("balance"),
             createdAt = rs.instant("created_at"),
+            ownerId = rs.getString("owner_id"),
         )
     }
 
     fun insert(account: Account) {
         jdbc.sql(
             """
-            INSERT INTO accounts (id, owner_name, currency, balance, created_at)
-            VALUES (:id, :ownerName, :currency, :balance, :createdAt)
+            INSERT INTO accounts (id, owner_name, currency, balance, created_at, owner_id)
+            VALUES (:id, :ownerName, :currency, :balance, :createdAt, :ownerId)
             """,
         )
             .param("id", account.id)
+            .param("ownerId", account.ownerId)
             .param("ownerName", account.ownerName)
             .param("currency", account.currency)
             .param("balance", account.balance)
@@ -46,6 +48,12 @@ class AccountRepository(private val jdbc: JdbcClient) {
 
     fun findAll(): List<Account> =
         jdbc.sql("SELECT * FROM accounts ORDER BY created_at")
+            .query(mapper)
+            .list()
+
+    fun findByOwner(ownerId: String): List<Account> =
+        jdbc.sql("SELECT * FROM accounts WHERE owner_id = :ownerId ORDER BY created_at")
+            .param("ownerId", ownerId)
             .query(mapper)
             .list()
 
